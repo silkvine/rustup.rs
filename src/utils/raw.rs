@@ -1,15 +1,16 @@
+#[cfg(not(windows))]
 use std::env;
-use std::error;
-use std::ffi::{OsStr, OsString};
-use std::fmt;
 use std::fs;
+use std::fs::File;
 use std::io;
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, ExitStatus};
 use std::str;
 
-pub fn ensure_dir_exists<P: AsRef<Path>, F: FnOnce(&Path)>(
+#[cfg(not(windows))]
+use crate::{currentprocess::varsource::VarSource, process};
+
+pub(crate) fn ensure_dir_exists<P: AsRef<Path>, F: FnOnce(&Path)>(
     path: P,
     callback: F,
 ) -> io::Result<bool> {
@@ -21,7 +22,7 @@ pub fn ensure_dir_exists<P: AsRef<Path>, F: FnOnce(&Path)>(
     }
 }
 
-pub fn is_directory<P: AsRef<Path>>(path: P) -> bool {
+pub(crate) fn is_directory<P: AsRef<Path>>(path: P) -> bool {
     fs::metadata(path).ok().as_ref().map(fs::Metadata::is_dir) == Some(true)
 }
 
@@ -29,20 +30,43 @@ pub fn is_file<P: AsRef<Path>>(path: P) -> bool {
     fs::metadata(path).ok().as_ref().map(fs::Metadata::is_file) == Some(true)
 }
 
+#[cfg(windows)]
+pub fn open_dir(p: &Path) -> std::io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    options.open(p)
+}
+#[cfg(not(windows))]
+pub fn open_dir(p: &Path) -> std::io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(p)
+}
+
 pub fn path_exists<P: AsRef<Path>>(path: P) -> bool {
     fs::metadata(path).is_ok()
 }
 
-pub fn random_string(length: usize) -> String {
+pub(crate) fn random_string(length: usize) -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789_";
     let mut rng = rand::thread_rng();
     (0..length)
-        .map(|_| char::from(CHARSET[rng.gen_range(0, CHARSET.len())]))
+        .map(|_| char::from(CHARSET[rng.gen_range(0..CHARSET.len())]))
         .collect()
 }
 
-pub fn if_not_empty<S: PartialEq<str>>(s: S) -> Option<S> {
+pub(crate) fn if_not_empty<S: PartialEq<str>>(s: S) -> Option<S> {
     if s == *"" {
         None
     } else {
@@ -64,7 +88,7 @@ pub fn write_file(path: &Path, contents: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub fn filter_file<F: FnMut(&str) -> bool>(
+pub(crate) fn filter_file<F: FnMut(&str) -> bool>(
     src: &Path,
     dest: &Path,
     mut filter: F,
@@ -79,7 +103,7 @@ pub fn filter_file<F: FnMut(&str) -> bool>(
     for result in io::BufRead::lines(&mut reader) {
         let line = result?;
         if filter(&line) {
-            writeln!(&mut writer, "{}", &line)?;
+            writeln!(writer, "{}", &line)?;
         } else {
             removed += 1;
         }
@@ -90,59 +114,27 @@ pub fn filter_file<F: FnMut(&str) -> bool>(
     Ok(removed)
 }
 
-pub fn match_file<T, F: FnMut(&str) -> Option<T>>(src: &Path, mut f: F) -> io::Result<Option<T>> {
-    let src_file = fs::File::open(src)?;
-
-    let mut reader = io::BufReader::new(src_file);
-
-    for result in io::BufRead::lines(&mut reader) {
-        let line = result?;
-        if let Some(r) = f(&line) {
-            return Ok(Some(r));
-        }
-    }
-
-    Ok(None)
-}
-
 pub fn append_file(dest: &Path, line: &str) -> io::Result<()> {
     let mut dest_file = fs::OpenOptions::new()
-        .write(true)
         .append(true)
         .create(true)
         .open(dest)?;
 
-    writeln!(&mut dest_file, "{}", line)?;
+    writeln!(dest_file, "{line}")?;
 
     dest_file.sync_data()?;
 
     Ok(())
 }
 
-pub fn tee_file<W: io::Write>(path: &Path, w: &mut W) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new().read(true).open(path)?;
-
-    let buffer_size = 0x10000;
-    let mut buffer = vec![0u8; buffer_size];
-
-    loop {
-        let bytes_read = io::Read::read(&mut file, &mut buffer)?;
-
-        if bytes_read != 0 {
-            io::Write::write_all(w, &buffer[0..bytes_read])?;
-        } else {
-            return Ok(());
-        }
-    }
-}
-
 pub fn symlink_dir(src: &Path, dest: &Path) -> io::Result<()> {
     #[cfg(windows)]
     fn symlink_dir_inner(src: &Path, dest: &Path) -> io::Result<()> {
-        // std's symlink uses Windows's symlink function, which requires
-        // admin. We can create directory junctions the hard way without
-        // though.
-        symlink_junction_inner(src, dest)
+        // On Windows creating symlinks isn't allowed by default so if it fails
+        // we fallback to creating a directory junction.
+        // We prefer to use symlinks here because junction point paths, unlike symlinks,
+        // must always be absolute. This makes moving the rustup directory difficult.
+        std::os::windows::fs::symlink_dir(src, dest).or_else(|_| symlink_junction_inner(src, dest))
     }
     #[cfg(not(windows))]
     fn symlink_dir_inner(src: &Path, dest: &Path) -> io::Result<()> {
@@ -175,14 +167,15 @@ fn symlink_junction_inner(target: &Path, junction: &Path) -> io::Result<()> {
     const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
 
     #[repr(C)]
-    pub struct REPARSE_MOUNTPOINT_DATA_BUFFER {
-        pub ReparseTag: DWORD,
-        pub ReparseDataLength: DWORD,
-        pub Reserved: WORD,
-        pub ReparseTargetLength: WORD,
-        pub ReparseTargetMaximumLength: WORD,
-        pub Reserved1: WORD,
-        pub ReparseTarget: WCHAR,
+    #[allow(non_snake_case)]
+    struct REPARSE_MOUNTPOINT_DATA_BUFFER {
+        ReparseTag: DWORD,
+        ReparseDataLength: DWORD,
+        Reserved: WORD,
+        ReparseTargetLength: WORD,
+        ReparseTargetMaximumLength: WORD,
+        Reserved1: WORD,
+        ReparseTarget: WCHAR,
     }
 
     // We're using low-level APIs to create the junction, and these are more picky about paths.
@@ -206,7 +199,7 @@ fn symlink_junction_inner(target: &Path, junction: &Path) -> io::Result<()> {
         );
 
         let mut data = [0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
-        let db = data.as_mut_ptr() as *mut REPARSE_MOUNTPOINT_DATA_BUFFER;
+        let db = data.as_mut_ptr().cast::<REPARSE_MOUNTPOINT_DATA_BUFFER>();
         let buf = &mut (*db).ReparseTarget as *mut WCHAR;
         let mut i = 0;
         // FIXME: this conversion is very hacky
@@ -225,9 +218,9 @@ fn symlink_junction_inner(target: &Path, junction: &Path) -> io::Result<()> {
 
         let mut ret = 0;
         let res = DeviceIoControl(
-            h as *mut _,
+            h.cast(),
             FSCTL_SET_REPARSE_POINT,
-            data.as_ptr() as *mut _,
+            data.as_mut_ptr().cast(),
             (*db).ReparseDataLength + 8,
             ptr::null_mut(),
             0,
@@ -243,54 +236,9 @@ fn symlink_junction_inner(target: &Path, junction: &Path) -> io::Result<()> {
     }
 }
 
-pub fn hardlink(src: &Path, dest: &Path) -> io::Result<()> {
+pub(crate) fn hardlink(src: &Path, dest: &Path) -> io::Result<()> {
     let _ = fs::remove_file(dest);
     fs::hard_link(src, dest)
-}
-
-#[derive(Debug)]
-pub enum CommandError {
-    Io(io::Error),
-    Status(ExitStatus),
-}
-
-pub type CommandResult<T> = std::result::Result<T, CommandError>;
-
-impl error::Error for CommandError {
-    fn description(&self) -> &str {
-        use self::CommandError::*;
-        match self {
-            Io(_) => "could not execute command",
-            Status(_) => "command exited with unsuccessful status",
-        }
-    }
-
-    fn cause(&self) -> Option<&dyn error::Error> {
-        use self::CommandError::*;
-        match self {
-            Io(e) => Some(e),
-            Status(_) => None,
-        }
-    }
-}
-
-impl fmt::Display for CommandError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CommandError::Io(e) => write!(f, "Io: {}", e),
-            CommandError::Status(s) => write!(f, "Status: {}", s),
-        }
-    }
-}
-
-pub fn cmd_status(cmd: &mut Command) -> CommandResult<()> {
-    cmd.status().map_err(CommandError::Io).and_then(|s| {
-        if s.success() {
-            Ok(())
-        } else {
-            Err(CommandError::Status(s))
-        }
-    })
 }
 
 pub fn remove_dir(path: &Path) -> io::Result<()> {
@@ -309,7 +257,7 @@ pub fn remove_dir(path: &Path) -> io::Result<()> {
     }
 }
 
-pub fn copy_dir(src: &Path, dest: &Path) -> io::Result<()> {
+pub(crate) fn copy_dir(src: &Path, dest: &Path) -> io::Result<()> {
     fs::create_dir(dest)?;
     for entry in src.read_dir()? {
         let entry = entry?;
@@ -325,31 +273,27 @@ pub fn copy_dir(src: &Path, dest: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn prefix_arg<S: AsRef<OsStr>>(name: &str, s: S) -> OsString {
-    let mut arg = OsString::from(name);
-    arg.push(s);
-    arg
-}
-
-pub fn has_cmd(cmd: &str) -> bool {
+#[cfg(not(windows))]
+fn has_cmd(cmd: &str) -> bool {
     let cmd = format!("{}{}", cmd, env::consts::EXE_SUFFIX);
-    let path = env::var_os("PATH").unwrap_or_default();
+    let path = process().var_os("PATH").unwrap_or_default();
     env::split_paths(&path)
         .map(|p| p.join(&cmd))
         .any(|p| p.exists())
 }
 
-pub fn find_cmd<'a>(cmds: &[&'a str]) -> Option<&'a str> {
+#[cfg(not(windows))]
+pub(crate) fn find_cmd<'a>(cmds: &[&'a str]) -> Option<&'a str> {
     cmds.iter().cloned().find(|&s| has_cmd(s))
 }
 
 #[cfg(windows)]
-pub mod windows {
+pub(crate) mod windows {
     use std::ffi::OsStr;
     use std::io;
     use std::os::windows::ffi::OsStrExt;
 
-    pub fn to_u16s<S: AsRef<OsStr>>(s: S) -> io::Result<Vec<u16>> {
+    pub(crate) fn to_u16s<S: AsRef<OsStr>>(s: S) -> io::Result<Vec<u16>> {
         fn inner(s: &OsStr) -> io::Result<Vec<u16>> {
             let mut maybe_result: Vec<u16> = s.encode_wide().collect();
             if maybe_result.iter().any(|&u| u == 0) {

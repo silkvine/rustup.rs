@@ -1,9 +1,11 @@
-use crate::dist::dist::TargetTriple;
+use crate::dist::dist::{TargetTriple, ToolchainDesc};
+use crate::dist::manifest::Component;
 use crate::dist::temp;
-use crate::errors::*;
 use crate::utils::notify::NotificationLevel;
 use std::fmt::{self, Display};
 use std::path::Path;
+
+use super::manifest::Manifest;
 
 #[derive(Debug)]
 pub enum Notification<'a> {
@@ -15,12 +17,11 @@ pub enum Notification<'a> {
     CantReadUpdateHash(&'a Path),
     NoUpdateHash(&'a Path),
     ChecksumValid(&'a str),
-    SignatureValid(&'a str),
     FileAlreadyDownloaded,
     CachedFileChecksumFailed,
     RollingBack,
     ExtensionNotInstalled(&'a str),
-    NonFatalError(&'a Error),
+    NonFatalError(&'a anyhow::Error),
     MissingInstalledComponent(&'a str),
     DownloadingComponent(&'a str, &'a TargetTriple, Option<&'a TargetTriple>),
     InstallingComponent(&'a str, &'a TargetTriple, Option<&'a TargetTriple>),
@@ -29,25 +30,29 @@ pub enum Notification<'a> {
     DownloadingManifest(&'a str),
     DownloadedManifest(&'a str, Option<&'a str>),
     DownloadingLegacyManifest,
+    SkippingNightlyMissingComponent(&'a ToolchainDesc, &'a Manifest, &'a [Component]),
+    ForcingUnavailableComponent(&'a str),
     ManifestChecksumFailedHack,
     ComponentUnavailable(&'a str, Option<&'a TargetTriple>),
     StrayHash(&'a Path),
+    SignatureInvalid(&'a str),
+    RetryingDownload(&'a str),
 }
 
 impl<'a> From<crate::utils::Notification<'a>> for Notification<'a> {
-    fn from(n: crate::utils::Notification<'a>) -> Notification<'a> {
+    fn from(n: crate::utils::Notification<'a>) -> Self {
         Notification::Utils(n)
     }
 }
 
 impl<'a> From<temp::Notification<'a>> for Notification<'a> {
-    fn from(n: temp::Notification<'a>) -> Notification<'a> {
+    fn from(n: temp::Notification<'a>) -> Self {
         Notification::Temp(n)
     }
 }
 
 impl<'a> Notification<'a> {
-    pub fn level(&self) -> NotificationLevel {
+    pub(crate) fn level(&self) -> NotificationLevel {
         use self::Notification::*;
         match self {
             Temp(n) => n.level(),
@@ -57,7 +62,6 @@ impl<'a> Notification<'a> {
             | FileAlreadyDownloaded
             | DownloadingLegacyManifest => NotificationLevel::Verbose,
             Extracting(_, _)
-            | SignatureValid(_)
             | DownloadingComponent(_, _, _)
             | InstallingComponent(_, _, _)
             | RemovingComponent(_, _, _)
@@ -66,14 +70,18 @@ impl<'a> Notification<'a> {
             | ManifestChecksumFailedHack
             | RollingBack
             | DownloadingManifest(_)
+            | SkippingNightlyMissingComponent(_, _, _)
+            | RetryingDownload(_)
             | DownloadedManifest(_, _) => NotificationLevel::Info,
             CantReadUpdateHash(_)
             | ExtensionNotInstalled(_)
             | MissingInstalledComponent(_)
             | CachedFileChecksumFailed
             | ComponentUnavailable(_, _)
+            | ForcingUnavailableComponent(_)
             | StrayHash(_) => NotificationLevel::Warn,
             NonFatalError(_) => NotificationLevel::Error,
+            SignatureInvalid(_) => NotificationLevel::Warn,
         }
     }
 }
@@ -85,7 +93,7 @@ impl<'a> Display for Notification<'a> {
             Temp(n) => n.fmt(f),
             Utils(n) => n.fmt(f),
             Extracting(_, _) => write!(f, "extracting..."),
-            ComponentAlreadyInstalled(c) => write!(f, "component {} is up to date", c),
+            ComponentAlreadyInstalled(c) => write!(f, "component {c} is up to date"),
             CantReadUpdateHash(path) => write!(
                 f,
                 "can't read update hash file: '{}', can't skip update...",
@@ -93,39 +101,38 @@ impl<'a> Display for Notification<'a> {
             ),
             NoUpdateHash(path) => write!(f, "no update hash at: '{}'", path.display()),
             ChecksumValid(_) => write!(f, "checksum passed"),
-            SignatureValid(_) => write!(f, "signature valid"),
             FileAlreadyDownloaded => write!(f, "reusing previously downloaded file"),
             CachedFileChecksumFailed => write!(f, "bad checksum for cached download"),
             RollingBack => write!(f, "rolling back changes"),
-            ExtensionNotInstalled(c) => write!(f, "extension '{}' was not installed", c),
-            NonFatalError(e) => write!(f, "{}", e),
+            ExtensionNotInstalled(c) => write!(f, "extension '{c}' was not installed"),
+            NonFatalError(e) => write!(f, "{e}"),
             MissingInstalledComponent(c) => {
-                write!(f, "during uninstall component {} was not found", c)
+                write!(f, "during uninstall component {c} was not found")
             }
             DownloadingComponent(c, h, t) => {
                 if Some(h) == t.as_ref() || t.is_none() {
-                    write!(f, "downloading component '{}'", c)
+                    write!(f, "downloading component '{c}'")
                 } else {
                     write!(f, "downloading component '{}' for '{}'", c, t.unwrap())
                 }
             }
             InstallingComponent(c, h, t) => {
                 if Some(h) == t.as_ref() || t.is_none() {
-                    write!(f, "installing component '{}'", c)
+                    write!(f, "installing component '{c}'")
                 } else {
                     write!(f, "installing component '{}' for '{}'", c, t.unwrap())
                 }
             }
             RemovingComponent(c, h, t) => {
                 if Some(h) == t.as_ref() || t.is_none() {
-                    write!(f, "removing component '{}'", c)
+                    write!(f, "removing component '{c}'")
                 } else {
                     write!(f, "removing component '{}' for '{}'", c, t.unwrap())
                 }
             }
             RemovingOldComponent(c, h, t) => {
                 if Some(h) == t.as_ref() || t.is_none() {
-                    write!(f, "removing previous version of component '{}'", c)
+                    write!(f, "removing previous version of component '{c}'")
                 } else {
                     write!(
                         f,
@@ -135,12 +142,12 @@ impl<'a> Display for Notification<'a> {
                     )
                 }
             }
-            DownloadingManifest(t) => write!(f, "syncing channel updates for '{}'", t),
+            DownloadingManifest(t) => write!(f, "syncing channel updates for '{t}'"),
             DownloadedManifest(date, Some(version)) => {
-                write!(f, "latest update on {}, rust version {}", date, version)
+                write!(f, "latest update on {date}, rust version {version}")
             }
             DownloadedManifest(date, None) => {
-                write!(f, "latest update on {}, no rust version", date)
+                write!(f, "latest update on {date}, no rust version")
             }
             DownloadingLegacyManifest => write!(f, "manifest not found. trying legacy manifest"),
             ManifestChecksumFailedHack => {
@@ -148,13 +155,9 @@ impl<'a> Display for Notification<'a> {
             }
             ComponentUnavailable(pkg, toolchain) => {
                 if let Some(tc) = toolchain {
-                    write!(
-                        f,
-                        "component '{}' is not available anymore on target '{}'",
-                        pkg, tc
-                    )
+                    write!(f, "component '{pkg}' is not available on target '{tc}'")
                 } else {
-                    write!(f, "component '{}' is not available anymore", pkg)
+                    write!(f, "component '{pkg}' is not available")
                 }
             }
             StrayHash(path) => write!(
@@ -162,6 +165,27 @@ impl<'a> Display for Notification<'a> {
                 "removing stray hash found at '{}' in order to continue",
                 path.display()
             ),
+            SkippingNightlyMissingComponent(toolchain, manifest, components) => write!(
+                f,
+                "skipping nightly which is missing installed component{} '{}'",
+                if components.len() > 1 { "s" } else { "" },
+                components
+                    .iter()
+                    .map(|component| {
+                        if component.target.as_ref() != Some(&toolchain.target) {
+                            component.name(manifest)
+                        } else {
+                            component.short_name(manifest)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("', '")
+            ),
+            ForcingUnavailableComponent(component) => {
+                write!(f, "Force-skipping unavailable component '{component}'")
+            }
+            SignatureInvalid(url) => write!(f, "Signature verification failed for '{url}'"),
+            RetryingDownload(url) => write!(f, "retrying download for '{url}'"),
         }
     }
 }

@@ -1,0 +1,16 @@
+bin.name = "rustup"
+args = ["toolchain","uninstall","--help"]
+stdout = """
+...
+Uninstall a toolchain
+
+Usage: rustup[EXE] toolchain uninstall <toolchain>...
+
+Arguments:
+  <toolchain>...  Toolchain name, such as 'stable', 'nightly', '1.8.0', or a custom toolchain name.
+                  For more information see `rustup help toolchain`
+
+Options:
+  -h, --help  Print help
+"""
+stderr = ""

@@ -1,10 +1,10 @@
 // FIXME: stolen from cargo. Should be extracted into a common crate.
 
-//! Job management (mostly for windows)
+//! Job management (mostly for Windows)
 //!
 //! Most of the time when you're running cargo you expect Ctrl-C to actually
 //! terminate the entire tree of processes in play, not just the one at the top
-//! (cago). This currently works "by default" on Unix platforms because Ctrl-C
+//! (cargo). This currently works "by default" on Unix platforms because Ctrl-C
 //! actually sends a signal to the *process group* rather than the parent
 //! process, so everything will get torn down. On Windows, however, this does
 //! not happen and Ctrl-C just kills cargo.
@@ -17,17 +17,19 @@
 //! child will be associated with the job object as well. This means if we add
 //! ourselves to the job object we create then everything will get torn down!
 
-pub use self::imp::Setup;
+#![allow(clippy::missing_safety_doc)]
 
-pub fn setup() -> Option<Setup> {
+pub(crate) use self::imp::Setup;
+
+pub(crate) fn setup() -> Option<Setup> {
     unsafe { imp::setup() }
 }
 
 #[cfg(unix)]
 mod imp {
-    pub type Setup = ();
+    pub(crate) type Setup = ();
 
-    pub unsafe fn setup() -> Option<()> {
+    pub(crate) unsafe fn setup() -> Option<()> {
         Some(())
     }
 }
@@ -45,11 +47,11 @@ mod imp {
     use winapi::um::winnt::HANDLE;
     use winapi::um::winnt::*;
 
-    pub struct Setup {
+    pub(crate) struct Setup {
         job: Handle,
     }
 
-    pub struct Handle {
+    pub(crate) struct Handle {
         inner: HANDLE,
     }
 
@@ -57,7 +59,7 @@ mod imp {
         io::Error::last_os_error()
     }
 
-    pub unsafe fn setup() -> Option<Setup> {
+    pub(crate) unsafe fn setup() -> Option<Setup> {
         // Creates a new job object for us to use and then adds ourselves to it.
         // Note that all errors are basically ignored in this function,
         // intentionally. Job objects are "relatively new" in Windows,

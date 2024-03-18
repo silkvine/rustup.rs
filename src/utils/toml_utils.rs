@@ -1,22 +1,25 @@
-use crate::errors::*;
+use anyhow::{anyhow, Result};
+use thiserror::Error as ThisError;
 
-pub fn get_value(table: &mut toml::value::Table, key: &str, path: &str) -> Result<toml::Value> {
+fn get_value(table: &mut toml::value::Table, key: &str, path: &str) -> Result<toml::Value> {
     table
         .remove(key)
-        .ok_or_else(|| format!("missing key: '{}'", path.to_owned() + key).into())
+        .ok_or_else(|| anyhow!(format!("missing key: '{}'", path.to_owned() + key)))
 }
 
-pub fn get_string(table: &mut toml::value::Table, key: &str, path: &str) -> Result<String> {
-    get_value(table, key, path).and_then(|v| {
-        if let toml::Value::String(s) = v {
-            Ok(s)
-        } else {
-            Err(ErrorKind::ExpectedType("string", path.to_owned() + key).into())
-        }
-    })
+#[derive(Debug, ThisError)]
+#[error("expected type: '{0}' for '{1}'")]
+struct ExpectedType(&'static str, String);
+
+pub(crate) fn get_string(table: &mut toml::value::Table, key: &str, path: &str) -> Result<String> {
+    if let toml::Value::String(s) = get_value(table, key, path)? {
+        Ok(s)
+    } else {
+        Err(ExpectedType("string", path.to_owned() + key).into())
+    }
 }
 
-pub fn get_opt_string(
+pub(crate) fn get_opt_string(
     table: &mut toml::value::Table,
     key: &str,
     path: &str,
@@ -25,24 +28,24 @@ pub fn get_opt_string(
         if let toml::Value::String(s) = v {
             Ok(Some(s))
         } else {
-            Err(ErrorKind::ExpectedType("string", path.to_owned() + key).into())
+            Err(ExpectedType("string", path.to_owned() + key).into())
         }
     } else {
         Ok(None)
     }
 }
 
-pub fn get_bool(table: &mut toml::value::Table, key: &str, path: &str) -> Result<bool> {
+pub(crate) fn get_bool(table: &mut toml::value::Table, key: &str, path: &str) -> Result<bool> {
     get_value(table, key, path).and_then(|v| {
         if let toml::Value::Boolean(b) = v {
             Ok(b)
         } else {
-            Err(ErrorKind::ExpectedType("bool", path.to_owned() + key).into())
+            Err(ExpectedType("bool", path.to_owned() + key).into())
         }
     })
 }
 
-pub fn get_table(
+pub(crate) fn get_table(
     table: &mut toml::value::Table,
     key: &str,
     path: &str,
@@ -51,14 +54,14 @@ pub fn get_table(
         if let toml::Value::Table(t) = v {
             Ok(t)
         } else {
-            Err(ErrorKind::ExpectedType("table", path.to_owned() + key).into())
+            Err(ExpectedType("table", path.to_owned() + key).into())
         }
     } else {
         Ok(toml::value::Table::new())
     }
 }
 
-pub fn get_array(
+pub(crate) fn get_array(
     table: &mut toml::value::Table,
     key: &str,
     path: &str,
@@ -67,7 +70,7 @@ pub fn get_array(
         if let toml::Value::Array(s) = v {
             Ok(s)
         } else {
-            Err(ErrorKind::ExpectedType("table", path.to_owned() + key).into())
+            Err(ExpectedType("array", path.to_owned() + key).into())
         }
     } else {
         Ok(toml::value::Array::new())

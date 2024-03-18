@@ -1,61 +1,61 @@
-use crate::common::set_globals;
-use crate::errors::*;
-use crate::job;
-use rustup::command::run_command_for_dir;
-use rustup::utils::utils::{self, ExitCode};
-use rustup::Cfg;
-use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
-use std::process;
 
-pub fn main() -> Result<()> {
-    crate::self_update::cleanup_self_updater()?;
+use anyhow::Result;
+
+use crate::{
+    cli::{common::set_globals, job, self_update},
+    command::run_command_for_dir,
+    currentprocess::argsource::ArgSource,
+    toolchain::names::{LocalToolchainName, ResolvableLocalToolchainName},
+    utils::utils::{self, ExitCode},
+    Cfg,
+};
+
+#[cfg_attr(feature = "otel", tracing::instrument)]
+pub fn main(arg0: &str) -> Result<ExitCode> {
+    self_update::cleanup_self_updater()?;
 
     let ExitCode(c) = {
         let _setup = job::setup();
 
-        let mut args = env::args_os();
+        let mut args = crate::process().args_os().skip(1);
 
-        let arg0 = args.next().map(PathBuf::from);
-        let arg0 = arg0
-            .as_ref()
-            .and_then(|a| a.file_name())
-            .and_then(std::ffi::OsStr::to_str);
-        let arg0 = arg0.ok_or(ErrorKind::NoExeName)?;
-
-        // Check for a toolchain specifier.
+        // Check for a + toolchain specifier
         let arg1 = args.next();
-        let toolchain_arg = arg1
+        let toolchain = arg1
             .as_ref()
             .map(|arg| arg.to_string_lossy())
-            .filter(|arg| arg.starts_with('+'));
-        let toolchain = toolchain_arg.as_ref().map(|a| &a[1..]);
+            .filter(|arg| arg.starts_with('+'))
+            .map(|name| ResolvableLocalToolchainName::try_from(&name.as_ref()[1..]))
+            .transpose()?;
 
         // Build command args now while we know whether or not to skip arg 1.
-        let cmd_args: Vec<_> = if toolchain.is_none() {
-            env::args_os().skip(1).collect()
-        } else {
-            env::args_os().skip(2).collect()
-        };
+        let cmd_args: Vec<_> = crate::process()
+            .args_os()
+            .skip(1 + toolchain.is_some() as usize)
+            .collect();
 
-        let cfg = set_globals(false)?;
+        let cfg = set_globals(false, true)?;
         cfg.check_metadata_version()?;
-        direct_proxy(&cfg, &arg0, toolchain, &cmd_args)?
+        let toolchain = toolchain
+            .map(|t| t.resolve(&cfg.get_default_host_triple()?))
+            .transpose()?;
+        direct_proxy(&cfg, arg0, toolchain, &cmd_args)?
     };
 
-    process::exit(c)
+    Ok(ExitCode(c))
 }
 
+#[cfg_attr(feature = "otel", tracing::instrument(skip(cfg)))]
 fn direct_proxy(
     cfg: &Cfg,
     arg0: &str,
-    toolchain: Option<&str>,
+    toolchain: Option<LocalToolchainName>,
     args: &[OsString],
 ) -> Result<ExitCode> {
     let cmd = match toolchain {
         None => cfg.create_command_for_dir(&utils::current_dir()?, arg0)?,
-        Some(tc) => cfg.create_command_for_toolchain(tc, false, arg0)?,
+        Some(tc) => cfg.create_command_for_toolchain(&tc, false, arg0)?,
     };
-    Ok(run_command_for_dir(cmd, arg0, args)?)
+    run_command_for_dir(cmd, arg0, args)
 }

@@ -1,24 +1,40 @@
 //! Just a dumping ground for cli stuff
 
-use crate::errors::*;
-use crate::self_update;
-use crate::term2;
-use git_testament::{git_testament, render_testament};
-use lazy_static::lazy_static;
-use rustup::utils::notify::NotificationLevel;
-use rustup::utils::utils;
-use rustup::{Cfg, Notification, Toolchain, UpdateStatus};
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::cell::RefCell;
+use std::fmt::Display;
+use std::fs;
+use std::io::{BufRead, ErrorKind, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
-use std::{cmp, env, iter};
-use term2::Terminal;
-use wait_timeout::ChildExt;
+use std::{cmp, env};
 
-pub fn confirm(question: &str, default: bool) -> Result<bool> {
-    print!("{} ", question);
+use anyhow::{anyhow, Context, Result};
+use git_testament::{git_testament, render_testament};
+use once_cell::sync::Lazy;
+
+use super::self_update;
+use crate::cli::download_tracker::DownloadTracker;
+use crate::currentprocess::{
+    argsource::ArgSource,
+    filesource::{StdinSource, StdoutSource},
+    terminalsource,
+    varsource::VarSource,
+};
+use crate::dist::dist::{TargetTriple, ToolchainDesc};
+use crate::install::UpdateStatus;
+use crate::utils::notifications as util_notifications;
+use crate::utils::notify::NotificationLevel;
+use crate::utils::utils;
+use crate::{
+    dist::notifications as dist_notifications, toolchain::distributable::DistributableToolchain,
+};
+use crate::{process, toolchain::toolchain::Toolchain};
+use crate::{Cfg, Notification};
+
+pub(crate) const WARN_COMPLETE_PROFILE: &str = "downloading with complete profile isn't recommended unless you are a developer of the rust language";
+
+pub(crate) fn confirm(question: &str, default: bool) -> Result<bool> {
+    write!(process().stdout().lock(), "{question} ")?;
     let _ = std::io::stdout().flush();
     let input = read_line()?;
 
@@ -29,23 +45,27 @@ pub fn confirm(question: &str, default: bool) -> Result<bool> {
         _ => false,
     };
 
-    println!();
+    writeln!(process().stdout().lock())?;
 
     Ok(r)
 }
 
-pub enum Confirm {
+pub(crate) enum Confirm {
     Yes,
     No,
     Advanced,
 }
 
-pub fn confirm_advanced() -> Result<Confirm> {
-    println!();
-    println!("1) Proceed with installation (default)");
-    println!("2) Customize installation");
-    println!("3) Cancel installation");
-    print!(">");
+pub(crate) fn confirm_advanced(customized_install: bool) -> Result<Confirm> {
+    writeln!(process().stdout().lock())?;
+    let first_option = match customized_install {
+        true => "1) Proceed with selected options (default - just press enter)",
+        false => "1) Proceed with standard installation (default - just press enter)",
+    };
+    writeln!(process().stdout().lock(), "{first_option}")?;
+    writeln!(process().stdout().lock(), "2) Customize installation")?;
+    writeln!(process().stdout().lock(), "3) Cancel installation")?;
+    write!(process().stdout().lock(), ">")?;
 
     let _ = std::io::stdout().flush();
     let input = read_line()?;
@@ -56,17 +76,17 @@ pub fn confirm_advanced() -> Result<Confirm> {
         _ => Confirm::No,
     };
 
-    println!();
+    writeln!(process().stdout().lock())?;
 
     Ok(r)
 }
 
-pub fn question_str(question: &str, default: &str) -> Result<String> {
-    println!("{}", question);
+pub(crate) fn question_str(question: &str, default: &str) -> Result<String> {
+    writeln!(process().stdout().lock(), "{question} [{default}]")?;
     let _ = std::io::stdout().flush();
     let input = read_line()?;
 
-    println!();
+    writeln!(process().stdout().lock())?;
 
     if input.is_empty() {
         Ok(default.to_string())
@@ -75,13 +95,14 @@ pub fn question_str(question: &str, default: &str) -> Result<String> {
     }
 }
 
-pub fn question_bool(question: &str, default: bool) -> Result<bool> {
-    println!("{}", question);
+pub(crate) fn question_bool(question: &str, default: bool) -> Result<bool> {
+    let default_text = if default { "(Y/n)" } else { "(y/N)" };
+    writeln!(process().stdout().lock(), "{question} {default_text}")?;
 
     let _ = std::io::stdout().flush();
     let input = read_line()?;
 
-    println!();
+    writeln!(process().stdout().lock())?;
 
     if input.is_empty() {
         Ok(default)
@@ -94,114 +115,179 @@ pub fn question_bool(question: &str, default: bool) -> Result<bool> {
     }
 }
 
-pub fn read_line() -> Result<String> {
-    let stdin = std::io::stdin();
+pub(crate) fn read_line() -> Result<String> {
+    let stdin = process().stdin();
     let stdin = stdin.lock();
     let mut lines = stdin.lines();
-    lines
-        .next()
-        .and_then(std::result::Result::ok)
-        .ok_or_else(|| "unable to read from stdin for confirmation".into())
+    let lines = lines.next().transpose()?;
+    match lines {
+        None => Err(anyhow!("no lines found from stdin")),
+        Some(v) => Ok(v),
+    }
+    .context("unable to read from stdin for confirmation")
 }
 
-pub fn set_globals(verbose: bool) -> Result<Cfg> {
-    use crate::download_tracker::DownloadTracker;
-    use std::cell::RefCell;
+#[derive(Default)]
+struct NotifyOnConsole {
+    ram_notice_shown: bool,
+    verbose: bool,
+}
 
-    let download_tracker = RefCell::new(DownloadTracker::new());
-
-    Ok(Cfg::from_env(Arc::new(move |n: Notification<'_>| {
-        if download_tracker.borrow_mut().handle_notification(&n) {
-            return;
-        }
-
-        match n.level() {
-            NotificationLevel::Verbose => {
-                if verbose {
-                    verbose!("{}", n);
+impl NotifyOnConsole {
+    fn handle(&mut self, n: Notification<'_>) {
+        if let Notification::Install(dist_notifications::Notification::Utils(
+            util_notifications::Notification::SetDefaultBufferSize(_),
+        )) = &n
+        {
+            if self.ram_notice_shown {
+                return;
+            } else {
+                self.ram_notice_shown = true;
+            }
+        };
+        let level = n.level();
+        for n in format!("{n}").lines() {
+            match level {
+                NotificationLevel::Verbose => {
+                    if self.verbose {
+                        verbose!("{}", n);
+                    }
+                }
+                NotificationLevel::Info => {
+                    info!("{}", n);
+                }
+                NotificationLevel::Warn => {
+                    warn!("{}", n);
+                }
+                NotificationLevel::Error => {
+                    err!("{}", n);
+                }
+                NotificationLevel::Debug => {
+                    debug!("{}", n);
                 }
             }
-            NotificationLevel::Info => {
-                info!("{}", n);
-            }
-            NotificationLevel::Warn => {
-                warn!("{}", n);
-            }
-            NotificationLevel::Error => {
-                err!("{}", n);
-            }
         }
-    }))?)
+    }
 }
 
-pub fn show_channel_update(
+#[cfg_attr(feature = "otel", tracing::instrument)]
+pub(crate) fn set_globals(verbose: bool, quiet: bool) -> Result<Cfg> {
+    let download_tracker = DownloadTracker::new_with_display_progress(!quiet);
+    let console_notifier = RefCell::new(NotifyOnConsole {
+        verbose,
+        ..Default::default()
+    });
+
+    Cfg::from_env(Arc::new(move |n: Notification<'_>| {
+        if download_tracker.lock().unwrap().handle_notification(&n) {
+            return;
+        }
+        console_notifier.borrow_mut().handle(n);
+    }))
+}
+
+pub(crate) fn show_channel_update(
     cfg: &Cfg,
-    name: &str,
-    updated: rustup::Result<UpdateStatus>,
+    name: PackageUpdate,
+    updated: Result<UpdateStatus>,
 ) -> Result<()> {
-    show_channel_updates(cfg, vec![(name.to_string(), updated)])
+    show_channel_updates(cfg, vec![(name, updated)])
+}
+
+pub(crate) enum PackageUpdate {
+    Rustup,
+    Toolchain(ToolchainDesc),
+}
+
+impl Display for PackageUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PackageUpdate::Rustup => write!(f, "rustup"),
+            PackageUpdate::Toolchain(t) => write!(f, "{t}"),
+        }
+    }
 }
 
 fn show_channel_updates(
     cfg: &Cfg,
-    toolchains: Vec<(String, rustup::Result<UpdateStatus>)>,
+    updates: Vec<(PackageUpdate, Result<UpdateStatus>)>,
 ) -> Result<()> {
-    let data = toolchains.into_iter().map(|(name, result)| {
-        let toolchain = cfg.get_toolchain(&name, false).expect("");
-        let version = rustc_version(&toolchain);
+    let data = updates.into_iter().map(|(pkg, result)| {
+        let (banner, color) = match &result {
+            Ok(UpdateStatus::Installed) => ("installed", Some(terminalsource::Color::Green)),
+            Ok(UpdateStatus::Updated(_)) => ("updated", Some(terminalsource::Color::Green)),
+            Ok(UpdateStatus::Unchanged) => ("unchanged", None),
+            Err(_) => ("update failed", Some(terminalsource::Color::Red)),
+        };
 
-        let banner;
-        let color;
-        match result {
-            Ok(UpdateStatus::Installed) => {
-                banner = "installed";
-                color = Some(term2::color::BRIGHT_GREEN);
+        let (previous_version, version) = match &pkg {
+            PackageUpdate::Rustup => {
+                let previous_version: Option<String> = match result {
+                    Ok(UpdateStatus::Installed) | Ok(UpdateStatus::Unchanged) | Err(_) => None,
+                    _ => Some(env!("CARGO_PKG_VERSION").into()),
+                };
+                let version = match result {
+                    Err(_) | Ok(UpdateStatus::Installed) | Ok(UpdateStatus::Unchanged) => {
+                        env!("CARGO_PKG_VERSION").into()
+                    }
+                    Ok(UpdateStatus::Updated(v)) => v,
+                };
+                (previous_version, version)
             }
-            Ok(UpdateStatus::Updated) => {
-                banner = "updated";
-                color = Some(term2::color::BRIGHT_GREEN);
+            PackageUpdate::Toolchain(name) => {
+                // this is a bit strange: we don't supply the version we
+                // presumably had (for Installed and Unchanged), so we query it
+                // again. Perhaps we can do better.
+                let version = match Toolchain::new(cfg, name.into()) {
+                    Ok(t) => t.rustc_version(),
+                    Err(_) => String::from("(toolchain not installed)"),
+                };
+                let previous_version: Option<String> = match result {
+                    Ok(UpdateStatus::Installed) | Ok(UpdateStatus::Unchanged) | Err(_) => None,
+                    Ok(UpdateStatus::Updated(v)) => Some(v),
+                };
+                (previous_version, version)
             }
-            Ok(UpdateStatus::Unchanged) => {
-                banner = "unchanged";
-                color = None;
-            }
-            Err(_) => {
-                banner = "update failed";
-                color = Some(term2::color::BRIGHT_RED);
-            }
-        }
+        };
 
-        let width = name.len() + 1 + banner.len();
+        let width = pkg.to_string().len() + 1 + banner.len();
 
-        (name, banner, width, color, version)
+        Ok((pkg, banner, width, color, version, previous_version))
     });
 
-    let mut t = term2::stdout();
+    let mut t = process().stdout().terminal();
 
-    let data: Vec<_> = data.collect();
+    let data: Vec<_> = data.collect::<Result<_>>()?;
     let max_width = data
         .iter()
-        .fold(0, |a, &(_, _, width, _, _)| cmp::max(a, width));
+        .fold(0, |a, &(_, _, width, _, _, _)| cmp::max(a, width));
 
-    for (name, banner, width, color, version) in data {
+    for (pkg, banner, width, color, version, previous_version) in data {
         let padding = max_width - width;
-        let padding: String = iter::repeat(' ').take(padding).collect();
-        let _ = write!(t, "  {}", padding);
-        let _ = t.attr(term2::Attr::Bold);
+        let padding: String = " ".repeat(padding);
+        let _ = write!(t.lock(), "  {padding}");
+        let _ = t.attr(terminalsource::Attr::Bold);
         if let Some(color) = color {
             let _ = t.fg(color);
         }
-        let _ = write!(t, "{} ", name);
-        let _ = write!(t, "{}", banner);
+        let _ = write!(t.lock(), "{pkg} {banner}");
         let _ = t.reset();
-        let _ = writeln!(t, " - {}", version);
+        let _ = write!(t.lock(), " - {version}");
+        if let Some(previous_version) = previous_version {
+            let _ = write!(t.lock(), " (from {previous_version})");
+        }
+        let _ = writeln!(t.lock());
     }
-    let _ = writeln!(t);
+    let _ = writeln!(t.lock());
 
     Ok(())
 }
 
-pub fn update_all_channels(cfg: &Cfg, do_self_update: bool, force_update: bool) -> Result<()> {
+pub(crate) fn update_all_channels(
+    cfg: &Cfg,
+    do_self_update: bool,
+    force_update: bool,
+) -> Result<utils::ExitCode> {
     let toolchains = cfg.update_all_channels(force_update)?;
 
     if toolchains.is_empty() {
@@ -210,11 +296,15 @@ pub fn update_all_channels(cfg: &Cfg, do_self_update: bool, force_update: bool) 
 
     let show_channel_updates = || {
         if !toolchains.is_empty() {
-            println!();
+            writeln!(process().stdout().lock())?;
 
-            show_channel_updates(cfg, toolchains)?;
+            let t = toolchains
+                .into_iter()
+                .map(|(p, s)| (PackageUpdate::Toolchain(p), s))
+                .collect();
+            show_channel_updates(cfg, t)?;
         }
-        Ok(())
+        Ok(utils::ExitCode(0))
     };
 
     if do_self_update {
@@ -225,42 +315,24 @@ pub fn update_all_channels(cfg: &Cfg, do_self_update: bool, force_update: bool) 
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum SelfUpdatePermission {
+pub(crate) enum SelfUpdatePermission {
     HardFail,
     Skip,
     Permit,
 }
 
-pub fn self_update_permitted(explicit: bool) -> Result<SelfUpdatePermission> {
+pub(crate) fn self_update_permitted(explicit: bool) -> Result<SelfUpdatePermission> {
     if cfg!(windows) {
         Ok(SelfUpdatePermission::Permit)
     } else {
         // Detect if rustup is not meant to self-update
-        match env::var("SNAP") {
-            Ok(_) => {
-                // We're running under snappy so don't even bother
-                // trying to self-update
-                // TODO: Report this to the user?
-                // TODO: Maybe ask snapd if there's an update and report
-                //       that to the user instead?
-                debug!("Skipping self-update because SNAP was detected");
-                if explicit {
-                    return Ok(SelfUpdatePermission::HardFail);
-                } else {
-                    return Ok(SelfUpdatePermission::Skip);
-                }
-            }
-            Err(env::VarError::NotPresent) => {}
-            Err(e) => Err(format!(
-                "Could not interrogate SNAP environment variable: {}",
-                e
-            ))?,
-        }
         let current_exe = env::current_exe()?;
         let current_exe_dir = current_exe.parent().expect("Rustup isn't in a directory‽");
-        match tempdir::TempDir::new_in(current_exe_dir, "updtest") {
-            Ok(_) => {}
-            Err(e) => match e.kind() {
+        if let Err(e) = tempfile::Builder::new()
+            .prefix("updtest")
+            .tempdir_in(current_exe_dir)
+        {
+            match e.kind() {
                 ErrorKind::PermissionDenied => {
                     debug!("Skipping self-update because we cannot write to the rustup dir");
                     if explicit {
@@ -269,23 +341,23 @@ pub fn self_update_permitted(explicit: bool) -> Result<SelfUpdatePermission> {
                         return Ok(SelfUpdatePermission::Skip);
                     }
                 }
-                _ => Err(e)?,
-            },
+                _ => return Err(e.into()),
+            }
         }
         Ok(SelfUpdatePermission::Permit)
     }
 }
 
-pub fn self_update<F>(before_restart: F) -> Result<()>
+pub(crate) fn self_update<F>(before_restart: F) -> Result<utils::ExitCode>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnOnce() -> Result<utils::ExitCode>,
 {
     match self_update_permitted(false)? {
         SelfUpdatePermission::HardFail => {
             err!("Unable to self-update.  STOP");
-            std::process::exit(1);
+            return Ok(utils::ExitCode(1));
         }
-        SelfUpdatePermission::Skip => return Ok(()),
+        SelfUpdatePermission::Skip => return Ok(utils::ExitCode(0)),
         SelfUpdatePermission::Permit => {}
     }
 
@@ -294,97 +366,22 @@ where
     before_restart()?;
 
     if let Some(ref setup_path) = setup_path {
-        self_update::run_update(setup_path)?;
-
-        unreachable!(); // update exits on success
+        return self_update::run_update(setup_path);
     } else {
         // Try again in case we emitted "tool `{}` is already installed" last time.
         self_update::install_proxies()?;
     }
 
-    Ok(())
+    Ok(utils::ExitCode(0))
 }
 
-pub fn rustc_version(toolchain: &Toolchain<'_>) -> String {
-    if toolchain.exists() {
-        let rustc_path = toolchain.binary_file("rustc");
-        if utils::is_file(&rustc_path) {
-            let mut cmd = Command::new(&rustc_path);
-            cmd.arg("--version");
-            cmd.stdin(Stdio::null());
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-            toolchain.set_ldpath(&mut cmd);
-
-            // some toolchains are faulty with some combinations of platforms and
-            // may fail to launch but also to timely terminate.
-            // (known cases include Rust 1.3.0 through 1.10.0 in recent macOS Sierra.)
-            // we guard against such cases by enforcing a reasonable timeout to read.
-            let mut line1 = None;
-            if let Ok(mut child) = cmd.spawn() {
-                let timeout = Duration::new(10, 0);
-                match child.wait_timeout(timeout) {
-                    Ok(Some(status)) if status.success() => {
-                        let out = child
-                            .stdout
-                            .expect("Child::stdout requested but not present");
-                        let mut line = String::new();
-                        if BufReader::new(out).read_line(&mut line).is_ok() {
-                            let lineend = line.trim_end_matches(&['\r', '\n'][..]).len();
-                            line.truncate(lineend);
-                            line1 = Some(line);
-                        }
-                    }
-                    Ok(None) => {
-                        let _ = child.kill();
-                        return String::from("(timeout reading rustc version)");
-                    }
-                    Ok(Some(_)) | Err(_) => {}
-                }
-            }
-
-            if let Some(line1) = line1 {
-                line1.to_owned()
-            } else {
-                String::from("(error reading rustc version)")
-            }
-        } else {
-            String::from("(rustc does not exist)")
-        }
-    } else {
-        String::from("(toolchain not installed)")
-    }
-}
-
-pub fn list_targets(toolchain: &Toolchain<'_>) -> Result<()> {
-    let mut t = term2::stdout();
-    for component in toolchain.list_components()? {
-        if component.component.short_name_in_manifest() == "rust-std" {
-            let target = component
-                .component
-                .target
-                .as_ref()
-                .expect("rust-std should have a target");
-            if component.required {
-                let _ = t.attr(term2::Attr::Bold);
-                let _ = writeln!(t, "{} (default)", target);
-                let _ = t.reset();
-            } else if component.installed {
-                let _ = t.attr(term2::Attr::Bold);
-                let _ = writeln!(t, "{} (installed)", target);
-                let _ = t.reset();
-            } else if component.available {
-                let _ = writeln!(t, "{}", target);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub fn list_installed_targets(toolchain: &Toolchain<'_>) -> Result<()> {
-    let mut t = term2::stdout();
-    for component in toolchain.list_components()? {
+pub(crate) fn list_targets(distributable: DistributableToolchain<'_>) -> Result<utils::ExitCode> {
+    let mut t = process().stdout().terminal();
+    let manifestation = distributable.get_manifestation()?;
+    let config = manifestation.read_config()?.unwrap_or_default();
+    let manifest = distributable.get_manifest()?;
+    let components = manifest.query_components(distributable.desc(), &config)?;
+    for component in components {
         if component.component.short_name_in_manifest() == "rust-std" {
             let target = component
                 .component
@@ -392,70 +389,150 @@ pub fn list_installed_targets(toolchain: &Toolchain<'_>) -> Result<()> {
                 .as_ref()
                 .expect("rust-std should have a target");
             if component.installed {
-                writeln!(t, "{}", target)?;
+                let _ = t.attr(terminalsource::Attr::Bold);
+                let _ = writeln!(t.lock(), "{target} (installed)");
+                let _ = t.reset();
+            } else if component.available {
+                let _ = writeln!(t.lock(), "{target}");
             }
         }
     }
-    Ok(())
+
+    Ok(utils::ExitCode(0))
 }
 
-pub fn list_components(toolchain: &Toolchain<'_>) -> Result<()> {
-    let mut t = term2::stdout();
-    for component in toolchain.list_components()? {
+pub(crate) fn list_installed_targets(
+    distributable: DistributableToolchain<'_>,
+) -> Result<utils::ExitCode> {
+    let t = process().stdout();
+    let manifestation = distributable.get_manifestation()?;
+    let config = manifestation.read_config()?.unwrap_or_default();
+    let manifest = distributable.get_manifest()?;
+    let components = manifest.query_components(distributable.desc(), &config)?;
+    for component in components {
+        if component.component.short_name_in_manifest() == "rust-std" {
+            let target = component
+                .component
+                .target
+                .as_ref()
+                .expect("rust-std should have a target");
+            if component.installed {
+                writeln!(t.lock(), "{target}")?;
+            }
+        }
+    }
+    Ok(utils::ExitCode(0))
+}
+
+pub(crate) fn list_components(
+    distributable: DistributableToolchain<'_>,
+) -> Result<utils::ExitCode> {
+    let mut t = process().stdout().terminal();
+
+    let manifestation = distributable.get_manifestation()?;
+    let config = manifestation.read_config()?.unwrap_or_default();
+    let manifest = distributable.get_manifest()?;
+    let components = manifest.query_components(distributable.desc(), &config)?;
+    for component in components {
         let name = component.name;
-        if component.required {
-            t.attr(term2::Attr::Bold)?;
-            writeln!(t, "{} (default)", name)?;
-            t.reset()?;
-        } else if component.installed {
-            t.attr(term2::Attr::Bold)?;
-            writeln!(t, "{} (installed)", name)?;
+        if component.installed {
+            t.attr(terminalsource::Attr::Bold)?;
+            writeln!(t.lock(), "{name} (installed)")?;
             t.reset()?;
         } else if component.available {
-            writeln!(t, "{}", name)?;
+            writeln!(t.lock(), "{name}")?;
         }
     }
 
-    Ok(())
+    Ok(utils::ExitCode(0))
 }
 
-pub fn list_installed_components(toolchain: &Toolchain<'_>) -> Result<()> {
-    let mut t = term2::stdout();
-    for component in toolchain.list_components()? {
+pub(crate) fn list_installed_components(distributable: DistributableToolchain<'_>) -> Result<()> {
+    let t = process().stdout();
+    for component in distributable.components()? {
         if component.installed {
-            writeln!(t, "{}", component.name)?;
+            writeln!(t.lock(), "{}", component.name)?;
         }
     }
     Ok(())
 }
 
-pub fn list_toolchains(cfg: &Cfg) -> Result<()> {
-    let toolchains = cfg.list_toolchains()?;
+fn print_toolchain_path(
+    cfg: &Cfg,
+    toolchain: &str,
+    if_default: &str,
+    if_override: &str,
+    verbose: bool,
+) -> Result<()> {
+    let toolchain_path = cfg.toolchains_dir.join(toolchain);
+    let toolchain_meta = fs::symlink_metadata(&toolchain_path)?;
+    let toolchain_path = if verbose {
+        if toolchain_meta.is_dir() {
+            format!("\t{}", toolchain_path.display())
+        } else {
+            format!("\t{}", fs::read_link(toolchain_path)?.display())
+        }
+    } else {
+        String::new()
+    };
+    writeln!(
+        process().stdout().lock(),
+        "{}{}{}{}",
+        &toolchain,
+        if_default,
+        if_override,
+        toolchain_path
+    )?;
+    Ok(())
+}
 
+pub(crate) fn list_toolchains(cfg: &Cfg, verbose: bool) -> Result<utils::ExitCode> {
+    // Work with LocalToolchainName to accommodate path based overrides
+    let toolchains = cfg
+        .list_toolchains()?
+        .iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
     if toolchains.is_empty() {
-        println!("no installed toolchains");
-    } else if let Ok(Some(def_toolchain)) = cfg.find_default() {
+        writeln!(process().stdout().lock(), "no installed toolchains")?;
+    } else {
+        let def_toolchain_name = cfg.get_default()?.map(|t| (&t).into());
+        let cwd = utils::current_dir()?;
+        let ovr_toolchain_name = if let Ok(Some((toolchain, _reason))) = cfg.find_override(&cwd) {
+            Some(toolchain)
+        } else {
+            None
+        };
         for toolchain in toolchains {
-            let if_default = if def_toolchain.name() == &*toolchain {
+            let if_default = if def_toolchain_name.as_ref() == Some(&toolchain) {
                 " (default)"
             } else {
                 ""
             };
-            println!("{}{}", &toolchain, if_default);
-        }
-    } else {
-        for toolchain in toolchains {
-            println!("{}", &toolchain);
+            let if_override = if ovr_toolchain_name.as_ref() == Some(&toolchain) {
+                " (override)"
+            } else {
+                ""
+            };
+
+            print_toolchain_path(
+                cfg,
+                &toolchain.to_string(),
+                if_default,
+                if_override,
+                verbose,
+            )
+            .context("Failed to list toolchains' directories")?;
         }
     }
-    Ok(())
+    Ok(utils::ExitCode(0))
 }
 
-pub fn list_overrides(cfg: &Cfg) -> Result<()> {
+pub(crate) fn list_overrides(cfg: &Cfg) -> Result<utils::ExitCode> {
     let overrides = cfg.settings_file.with(|s| Ok(s.overrides.clone()))?;
 
     if overrides.is_empty() {
-        println!("no overrides");
+        writeln!(process().stdout().lock(), "no overrides")?;
     } else {
         let mut any_not_exist = false;
         for (k, v) in overrides {
@@ -463,87 +540,143 @@ pub fn list_overrides(cfg: &Cfg) -> Result<()> {
             if !dir_exists {
                 any_not_exist = true;
             }
-            println!(
+            writeln!(
+                process().stdout().lock(),
                 "{:<40}\t{:<20}",
                 utils::format_path_for_display(&k)
                     + if dir_exists { "" } else { " (not a directory)" },
                 v
-            )
+            )?
         }
         if any_not_exist {
-            println!();
+            writeln!(process().stdout().lock())?;
             info!(
                 "you may remove overrides for non-existent directories with
 `rustup override unset --nonexistent`"
             );
         }
     }
-    Ok(())
+    Ok(utils::ExitCode(0))
 }
 
 git_testament!(TESTAMENT);
 
-pub fn version() -> &'static str {
-    lazy_static! {
-        // Because we trust our `stable` branch given the careful release
-        // process, we mark it trusted here so that our version numbers look
-        // right when built from CI before the tag is pushed
-        static ref RENDERED: String = render_testament!(TESTAMENT, "stable");
-    }
+pub(crate) fn version() -> &'static str {
+    // Because we trust our `stable` branch given the careful release
+    // process, we mark it trusted here so that our version numbers look
+    // right when built from CI before the tag is pushed
+    static RENDERED: Lazy<String> = Lazy::new(|| render_testament!(TESTAMENT, "stable"));
     &RENDERED
 }
 
-pub fn dump_testament() {
+pub(crate) fn dump_testament() -> Result<utils::ExitCode> {
     use git_testament::GitModification::*;
-    println!("Rustup version renders as: {}", version());
-    println!("Current crate version: {}", env!("CARGO_PKG_VERSION"));
+    writeln!(
+        process().stdout().lock(),
+        "Rustup version renders as: {}",
+        version()
+    )?;
+    writeln!(
+        process().stdout().lock(),
+        "Current crate version: {}",
+        env!("CARGO_PKG_VERSION")
+    )?;
     if TESTAMENT.branch_name.is_some() {
-        println!("Built from branch: {}", TESTAMENT.branch_name.unwrap());
+        writeln!(
+            process().stdout().lock(),
+            "Built from branch: {}",
+            TESTAMENT.branch_name.unwrap()
+        )?;
     } else {
-        println!("Branch information missing");
+        writeln!(process().stdout().lock(), "Branch information missing")?;
     }
-    println!("Commit info: {}", TESTAMENT.commit);
+    writeln!(
+        process().stdout().lock(),
+        "Commit info: {}",
+        TESTAMENT.commit
+    )?;
     if TESTAMENT.modifications.is_empty() {
-        println!("Working tree is clean");
+        writeln!(process().stdout().lock(), "Working tree is clean")?;
     } else {
         for fmod in TESTAMENT.modifications {
             match fmod {
-                Added(f) => println!("Added: {}", String::from_utf8_lossy(f)),
-                Removed(f) => println!("Removed: {}", String::from_utf8_lossy(f)),
-                Modified(f) => println!("Modified: {}", String::from_utf8_lossy(f)),
-                Untracked(f) => println!("Untracked: {}", String::from_utf8_lossy(f)),
+                Added(f) => writeln!(
+                    process().stdout().lock(),
+                    "Added: {}",
+                    String::from_utf8_lossy(f)
+                )?,
+                Removed(f) => writeln!(
+                    process().stdout().lock(),
+                    "Removed: {}",
+                    String::from_utf8_lossy(f)
+                )?,
+                Modified(f) => writeln!(
+                    process().stdout().lock(),
+                    "Modified: {}",
+                    String::from_utf8_lossy(f)
+                )?,
+                Untracked(f) => writeln!(
+                    process().stdout().lock(),
+                    "Untracked: {}",
+                    String::from_utf8_lossy(f)
+                )?,
             }
         }
+    }
+    Ok(utils::ExitCode(0))
+}
+
+fn show_backtrace() -> bool {
+    if let Ok(true) = process().var("RUSTUP_NO_BACKTRACE").map(|s| s == "1") {
+        return false;
+    }
+
+    if let Ok(true) = process().var("RUST_BACKTRACE").map(|s| s == "1") {
+        return true;
+    }
+
+    for arg in process().args() {
+        if arg == "-v" || arg == "--verbose" {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn report_error(e: &anyhow::Error) {
+    // NB: This shows one error: even for multiple causes and backtraces etc,
+    // rather than one per cause, and one for the backtrace. This seems like a
+    // reasonable tradeoff, but if we want to do differently, this is the code
+    // hunk to revisit, that and a similar build.rs auto-detect glue as anyhow
+    // has to detect when backtrace is available.
+    if show_backtrace() {
+        err!("{:?}", e);
+    } else {
+        err!("{:#}", e);
     }
 }
 
-pub fn report_error(e: &Error) {
-    err!("{}", e);
-
-    for e in e.iter().skip(1) {
-        info!("caused by: {}", e);
-    }
-
-    if show_backtrace() {
-        if let Some(backtrace) = e.backtrace() {
-            info!("backtrace:");
-            println!();
-            println!("{:?}", backtrace);
-        }
+pub(crate) fn ignorable_error(error: &'static str, no_prompt: bool) -> Result<()> {
+    let error = anyhow!(error);
+    report_error(&error);
+    if no_prompt {
+        warn!("continuing (because the -y flag is set and the error is ignorable)");
+        Ok(())
+    } else if confirm("\nContinue? (y/N)", false).unwrap_or(false) {
+        Ok(())
     } else {
+        Err(error)
     }
+}
 
-    fn show_backtrace() -> bool {
-        if let Ok(true) = env::var("RUST_BACKTRACE").map(|s| s == "1") {
-            return true;
-        }
-
-        for arg in env::args() {
-            if arg == "-v" || arg == "--verbose" {
-                return true;
-            }
-        }
-
-        false
+/// Warns if rustup is running under emulation, such as macOS Rosetta
+pub(crate) fn warn_if_host_is_emulated() {
+    if TargetTriple::is_host_emulated() {
+        warn!(
+            "Rustup is not running natively. It's running under emulation of {}.",
+            TargetTriple::from_host_or_build()
+        );
+        warn!("For best compatibility and performance you should reinstall rustup for your native CPU.");
     }
 }

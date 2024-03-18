@@ -1,388 +1,201 @@
 #![allow(clippy::large_enum_variant)]
 
-use crate::component_for_bin;
-use crate::dist::manifest::{Component, Manifest};
-use crate::dist::temp;
-use error_chain::error_chain;
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::fmt::Debug;
+#[cfg(not(windows))]
+use std::io;
+use std::io::Write;
 use std::path::PathBuf;
+
+use thiserror::Error as ThisError;
 use url::Url;
 
-pub const TOOLSTATE_MSG: &str =
-    "If you require these components, please install and use the latest successful build version,\n\
-     which you can find at <https://rust-lang.github.io/rustup-components-history>.\n\nAfter determining \
-     the correct date, install it with a command such as:\n\n    \
-     rustup toolchain install nightly-2018-12-27\n\n\
-     Then you can use the toolchain with commands such as:\n\n    \
-     cargo +nightly-2018-12-27 build";
+use crate::{
+    currentprocess::process,
+    dist::dist::{TargetTriple, ToolchainDesc},
+};
+use crate::{
+    dist::manifest::{Component, Manifest},
+    toolchain::names::{PathBasedToolchainName, ToolchainName},
+};
 
-error_chain! {
-    links {
-        Download(download::Error, download::ErrorKind);
-    }
+/// A type erasing thunk for the retry crate to permit use with anyhow. See <https://github.com/dtolnay/anyhow/issues/149>
+#[derive(Debug, ThisError)]
+#[error(transparent)]
+pub struct OperationError(pub anyhow::Error);
 
-    foreign_links {
-        Temp(temp::Error);
-        Io(io::Error);
-        Open(opener::OpenError);
-        Thread(std::sync::mpsc::RecvError);
-    }
-
-    errors {
-        LocatingWorkingDir {
-            description("could not locate working directory")
-        }
-        ReadingFile {
-            name: &'static str,
-            path: PathBuf,
-        } {
-            description("could not read file")
-            display("could not read {} file: '{}'", name, path.display())
-        }
-        ReadingDirectory {
-            name: &'static str,
-            path: PathBuf,
-        } {
-            description("could not read directory")
-            display("could not read {} directory: '{}'", name, path.display())
-        }
-        WritingFile {
-            name: &'static str,
-            path: PathBuf,
-        } {
-            description("could not write file")
-            display("could not write {} file: '{}'", name, path.display())
-        }
-        CreatingDirectory {
-            name: &'static str,
-            path: PathBuf,
-        } {
-            description("could not create directory")
-            display("could not create {} directory: '{}'", name, path.display())
-        }
-        ExpectedType(t: &'static str, n: String) {
-            description("expected type")
-            display("expected type: '{}' for '{}'", t, n)
-        }
-        FilteringFile {
-            name: &'static str,
-            src: PathBuf,
-            dest: PathBuf,
-        } {
-            description("could not copy file")
-            display("could not copy {} file from '{}' to '{}'", name, src.display(), dest.display())
-        }
-        RenamingFile {
-            name: &'static str,
-            src: PathBuf,
-            dest: PathBuf,
-        } {
-            description("could not rename file")
-            display("could not rename {} file from '{}' to '{}'",
-                name, src.display(), dest.display())
-        }
-        RenamingDirectory {
-            name: &'static str,
-            src: PathBuf,
-            dest: PathBuf,
-        } {
-            description("could not rename directory")
-            display("could not rename {} directory from '{}' to '{}'", name, src.display(), dest.display())
-        }
-        DownloadingFile {
-            url: Url,
-            path: PathBuf,
-        } {
-            description("could not download file")
-            display("could not download file from '{}' to '{}'", url, path.display())
-        }
-        DownloadNotExists {
-            url: Url,
-            path: PathBuf,
-        } {
-            description("could not download file")
-            display("could not download file from '{}' to '{}'", url, path.display())
-        }
-        InvalidUrl {
-            url: String,
-        } {
-            description("invalid url")
-            display("invalid url: {}", url)
-        }
-        RunningCommand {
-            name: OsString,
-        } {
-            description("command failed")
-            display("command failed: '{}'", PathBuf::from(name).display())
-        }
-        NotAFile {
-            path: PathBuf,
-        } {
-            description("not a file")
-            display("not a file: '{}'", path.display())
-        }
-        NotADirectory {
-            path: PathBuf,
-        } {
-            description("not a directory")
-            display("not a directory: '{}'", path.display())
-        }
-        LinkingFile {
-            src: PathBuf,
-            dest: PathBuf,
-        } {
-            description("could not link file")
-            display("could not create link from '{}' to '{}'", src.display(), dest.display())
-        }
-        LinkingDirectory {
-            src: PathBuf,
-            dest: PathBuf,
-        } {
-            description("could not symlink directory")
-            display("could not create link from '{}' to '{}'", src.display(), dest.display())
-        }
-        CopyingDirectory {
-            src: PathBuf,
-            dest: PathBuf,
-        } {
-            description("could not copy directory")
-            display("could not copy directory from '{}' to '{}'", src.display(), dest.display())
-        }
-        CopyingFile {
-            src: PathBuf,
-            dest: PathBuf,
-        } {
-            description("could not copy file")
-            display("could not copy file from '{}' to '{}'", src.display(), dest.display())
-        }
-        RemovingFile {
-            name: &'static str,
-            path: PathBuf,
-        } {
-            description("could not remove file")
-            display("could not remove '{}' file: '{}'", name, path.display())
-        }
-        RemovingDirectory {
-            name: &'static str,
-            path: PathBuf,
-        } {
-            description("could not remove directory")
-            display("could not remove '{}' directory: '{}'", name, path.display())
-        }
-        SettingPermissions {
-            path: PathBuf,
-        } {
-            description("failed to set permissions")
-            display("failed to set permissions for '{}'", path.display())
-        }
-        GettingCwd {
-            description("couldn't get current working directory")
-        }
-        CargoHome {
-            description("couldn't find value of CARGO_HOME")
-        }
-        RustupHome {
-            description("couldn't find value of RUSTUP_HOME")
-        }
-        InvalidToolchainName(t: String) {
-            description("invalid toolchain name")
-            display("invalid toolchain name: '{}'", t)
-        }
-        InvalidCustomToolchainName(t: String) {
-            description("invalid custom toolchain name")
-            display("invalid custom toolchain name: '{}'", t)
-        }
-        ChecksumFailed {
-            url: String,
-            expected: String,
-            calculated: String,
-        } {
-            description("checksum failed")
-            display("checksum failed, expected: '{}', calculated: '{}'",
-                    expected,
-                    calculated)
-        }
-        ComponentConflict {
-            name: String,
-            path: PathBuf,
-        } {
-            description("conflicting component")
-            display("failed to install component: '{}', detected conflict: '{:?}'",
-                    name,
-                    path)
-        }
-        ComponentMissingFile {
-            name: String,
-            path: PathBuf,
-        } {
-            description("missing file in component")
-            display("failure removing component '{}', directory does not exist: '{:?}'",
-                    name,
-                    path)
-        }
-        ComponentMissingDir {
-            name: String,
-            path: PathBuf,
-        } {
-            description("missing directory in component")
-            display("failure removing component '{}', directory does not exist: '{:?}'",
-                    name,
-                    path)
-        }
-        CorruptComponent(name: String) {
-            description("corrupt component manifest")
-            display("component manifest for '{}' is corrupt", name)
-        }
-        ExtractingPackage {
-            description("failed to extract package (perhaps you ran out of disk space?)")
-        }
-        BadInstallerVersion(v: String) {
-            description("unsupported installer version")
-            display("unsupported installer version: {}", v)
-        }
-        BadInstalledMetadataVersion(v: String) {
-            description("unsupported metadata version in existing installation")
-            display("unsupported metadata version in existing installation: {}", v)
-        }
-        ComponentDirPermissionsFailed {
-            description("I/O error walking directory during install")
-        }
-        ComponentFilePermissionsFailed {
-            description("error setting file permissions during install")
-        }
-        ComponentDownloadFailed(c: String) {
-            description("component download failed")
-            display("component download failed for {}", c)
-        }
-        Parsing(e: toml::de::Error) {
-            description("error parsing manifest")
-        }
-        UnsupportedVersion(v: String) {
-            description("unsupported manifest version")
-            display("manifest version '{}' is not supported", v)
-        }
-        MissingPackageForComponent(name: String) {
-            description("missing package for component")
-            display("server sent a broken manifest: missing package for component {}", name)
-        }
-        MissingPackageForRename(name: String) {
-            description("missing package for the target of a rename")
-            display("server sent a broken manifest: missing package for the target of a rename {}", name)
-        }
-        RequestedComponentsUnavailable(c: Vec<Component>, manifest: Manifest, toolchain: String) {
-            description("some requested components are unavailable to download")
-            display("{} for channel '{}'\n{}", component_unavailable_msg(&c, &manifest), toolchain, TOOLSTATE_MSG)
-        }
-        UnknownMetadataVersion(v: String) {
-            description("unknown metadata version")
-            display("unknown metadata version: '{}'", v)
-        }
-        ToolchainNotInstalled(t: String) {
-            description("toolchain is not installed")
-            display("toolchain '{}' is not installed", t)
-        }
-        OverrideToolchainNotInstalled(t: String) {
-            description("override toolchain is not installed")
-            display("override toolchain '{}' is not installed", t)
-        }
-        BinaryNotFound(bin: String, t: String, is_default: bool) {
-            description("toolchain does not contain binary")
-            display("'{}' is not installed for the toolchain '{}'{}", bin, t, install_msg(bin, t, *is_default))
-        }
-        NeedMetadataUpgrade {
-            description("rustup's metadata is out of date. run `rustup self upgrade-data`")
-        }
-        UpgradeIoError {
-            description("I/O error during upgrade")
-        }
-        BadInstallerType(s: String) {
-            description("invalid extension for installer")
-            display("invalid extension for installer: '{}'", s)
-        }
-        ComponentsUnsupported(t: String) {
-            description("toolchain does not support components")
-            display("toolchain '{}' does not support components", t)
-        }
-        UnknownComponent(t: String, c: String, s: Option<String>) {
-            description("toolchain does not contain component")
-            display("toolchain '{}' does not contain component {}{}", t, c, if let Some(suggestion) = s {
-                format!("; did you mean '{}'?", suggestion)
-            } else {
-                "".to_string()
-            })
-        }
-        AddingRequiredComponent(t: String, c: String) {
-            description("required component cannot be added")
-            display("component {} was automatically added because it is required for toolchain '{}'",
-                    c, t)
-        }
-        ParsingSettings(e: toml::de::Error) {
-            description("error parsing settings")
-        }
-        RemovingRequiredComponent(t: String, c: String) {
-            description("required component cannot be removed")
-            display("component {} is required for toolchain '{}' and cannot be removed",
-                    c, t)
-        }
-        NoExeName {
-            description("couldn't determine self executable name")
-        }
-        UnsupportedKind(v: String) {
-            description("unsupported tar entry")
-            display("tar entry kind '{}' is not supported", v)
-        }
-        BadPath(v: PathBuf) {
-            description("bad path in tar")
-            display("tar path '{}' is not supported", v.display())
-        }
-    }
+#[derive(ThisError, Debug)]
+pub(crate) enum RustupError {
+    #[error("partially downloaded file may have been damaged and was removed, please try again")]
+    BrokenPartialFile,
+    #[error("component download failed for {0}")]
+    ComponentDownloadFailed(String),
+    #[error("failure removing component '{name}', directory does not exist: '{}'", .path.display())]
+    ComponentMissingDir { name: String, path: PathBuf },
+    #[error("failure removing component '{name}', directory does not exist: '{}'", .path.display())]
+    ComponentMissingFile { name: String, path: PathBuf },
+    #[error("could not create {name} directory: '{}'", .path.display())]
+    CreatingDirectory { name: &'static str, path: PathBuf },
+    #[error("invalid toolchain name: '{0}'")]
+    InvalidToolchainName(String),
+    #[error("could not create link from '{}' to '{}'", .src.display(), .dest.display())]
+    LinkingFile { src: PathBuf, dest: PathBuf },
+    #[error("Unable to proceed. Could not locate working directory.")]
+    LocatingWorkingDir,
+    #[cfg(not(windows))]
+    #[error("failed to set permissions for '{}'", .p.display())]
+    SettingPermissions { p: PathBuf, source: io::Error },
+    #[error("checksum failed for '{url}', expected: '{expected}', calculated: '{calculated}'")]
+    ChecksumFailed {
+        url: String,
+        expected: String,
+        calculated: String,
+    },
+    #[error("failed to install component: '{name}', detected conflict: '{}'", .path.display())]
+    ComponentConflict { name: String, path: PathBuf },
+    #[error("toolchain '{0}' does not support components")]
+    ComponentsUnsupported(String),
+    #[error("toolchain '{0}' does not support components (v1 manifest)")]
+    ComponentsUnsupportedV1(String),
+    #[error("component manifest for '{0}' is corrupt")]
+    CorruptComponent(String),
+    #[error("could not download file from '{url}' to '{}'", .path.display())]
+    DownloadingFile { url: Url, path: PathBuf },
+    #[error("could not download file from '{url}' to '{}'", .path.display())]
+    DownloadNotExists { url: Url, path: PathBuf },
+    #[error("Missing manifest in toolchain '{}'", .0)]
+    MissingManifest(ToolchainDesc),
+    #[error("server sent a broken manifest: missing package for component {0}")]
+    MissingPackageForComponent(String),
+    #[error("could not read {name} directory: '{}'", .path.display())]
+    ReadingDirectory { name: &'static str, path: PathBuf },
+    #[error("could not read {name} file: '{}'", .path.display())]
+    ReadingFile { name: &'static str, path: PathBuf },
+    #[error("could not remove '{}' directory: '{}'", .name, .path.display())]
+    RemovingDirectory { name: &'static str, path: PathBuf },
+    #[error("could not remove '{name}' file: '{}'", .path.display())]
+    RemovingFile { name: &'static str, path: PathBuf },
+    #[error("{}", component_unavailable_msg(.components, .manifest, .toolchain))]
+    RequestedComponentsUnavailable {
+        components: Vec<Component>,
+        manifest: Manifest,
+        toolchain: String,
+    },
+    #[error("command failed: '{}'", PathBuf::from(.name).display())]
+    RunningCommand { name: OsString },
+    #[error("toolchain '{0}' is not installable")]
+    ToolchainNotInstallable(String),
+    #[error("toolchain '{0}' is not installed")]
+    ToolchainNotInstalled(ToolchainName),
+    #[error("path '{0}' not found")]
+    PathToolchainNotInstalled(PathBasedToolchainName),
+    #[error(
+        "rustup could not choose a version of {} to run, because one wasn't specified explicitly, and no default is configured.\n{}",
+        process().name().unwrap_or_else(|| "Rust".into()),
+        "help: run 'rustup default stable' to download the latest stable release of Rust and set it as your default toolchain."
+    )]
+    ToolchainNotSelected,
+    #[error("toolchain '{}' does not contain component {}{}{}", .desc, .component, suggest_message(.suggestion), if .component.contains("rust-std") {
+        format!("\nnote: not all platforms have the standard library pre-compiled: https://doc.rust-lang.org/nightly/rustc/platform-support.html{}",
+            if desc.channel == "nightly" { "\nhelp: consider using `cargo build -Z build-std` instead" } else { "" }
+        )
+    } else { "".to_string() })]
+    UnknownComponent {
+        desc: ToolchainDesc,
+        component: String,
+        suggestion: Option<String>,
+    },
+    #[error("toolchain '{}' does not support target '{}'{}\n\
+    note: you can see a list of supported targets with `rustc --print=target-list`\n\
+    note: if you are adding support for a new target to rustc itself, see https://rustc-dev-guide.rust-lang.org/building/new-target.html", .desc, .target,
+    suggest_message(.suggestion))]
+    UnknownTarget {
+        desc: ToolchainDesc,
+        target: TargetTriple,
+        suggestion: Option<String>,
+    },
+    #[error("toolchain '{}' does not have target '{}' installed{}\n", .desc, .target,
+    suggest_message(.suggestion))]
+    TargetNotInstalled {
+        desc: ToolchainDesc,
+        target: TargetTriple,
+        suggestion: Option<String>,
+    },
+    #[error("unknown metadata version: '{0}'")]
+    UnknownMetadataVersion(String),
+    #[error("manifest version '{0}' is not supported")]
+    UnsupportedVersion(String),
+    #[error("could not write {name} file: '{}'", .path.display())]
+    WritingFile { name: &'static str, path: PathBuf },
+    #[error("I/O Error")]
+    IOError(#[from] std::io::Error),
 }
 
-fn component_unavailable_msg(cs: &[Component], manifest: &Manifest) -> String {
-    assert!(!cs.is_empty());
-
-    let mut buf = vec![];
-
-    if cs.len() == 1 {
-        let _ = write!(
-            buf,
-            "component {} is unavailable for download",
-            &cs[0].description(manifest)
-        );
+fn suggest_message(suggestion: &Option<String>) -> String {
+    if let Some(suggestion) = suggestion {
+        format!("; did you mean '{}'?", suggestion)
     } else {
-        let same_target = cs
-            .iter()
-            .all(|c| c.target == cs[0].target || c.target.is_none());
-        if same_target {
-            let cs_str = cs
+        String::new()
+    }
+}
+
+/// Returns a error message indicating that certain [`Component`]s are unavailable.
+///
+/// See also [`component_missing_msg`](../dist/dist/fn.components_missing_msg.html)
+/// which generates error messages for component unavailability toolchain-wide operations.
+///
+/// # Panics
+/// This function will panic when the collection of unavailable components `cs` is empty.
+fn component_unavailable_msg(cs: &[Component], manifest: &Manifest, toolchain: &str) -> String {
+    let mut buf = vec![];
+    match cs {
+        [] => panic!("`component_unavailable_msg` should not be called with an empty collection of unavailable components"),
+        [c] => {
+            let _ = writeln!(
+                buf,
+                "component {} is unavailable for download for channel '{}'",
+                c.description(manifest),
+                toolchain,
+            );
+
+            if toolchain.starts_with("nightly") {
+                let _ = write!(
+                    buf,
+                    "Sometimes not all components are available in any given nightly. "
+                );
+            }
+        }
+        cs => {
+            // More than one component
+            let same_target = cs
                 .iter()
-                .map(|c| format!("'{}'", c.short_name(manifest)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = write!(buf, "some components unavailable for download: {}", cs_str,);
-        } else {
-            let cs_str = cs
-                .iter()
-                .map(|c| c.description(manifest))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = write!(buf, "some components unavailable for download: {}", cs_str,);
+                .all(|c| c.target == cs[0].target || c.target.is_none());
+
+            let cs_str = if same_target {
+                cs.iter()
+                    .map(|c| format!("'{}'", c.short_name(manifest)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                cs.iter()
+                    .map(|c| c.description(manifest))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+
+            let _ = write!(
+                buf,
+                "some components unavailable for download for channel '{toolchain}': {cs_str}"
+            );
+
+            if toolchain.starts_with("nightly") {
+                let _ = write!(
+                    buf,
+                    "Sometimes not all components are available in any given nightly. "
+                );
+            }
         }
     }
 
-    String::from_utf8(buf).expect("")
-}
-
-fn install_msg(bin: &str, toolchain: &str, is_default: bool) -> String {
-    match component_for_bin(bin) {
-        Some(c) => format!("\nTo install, run `rustup component add {}{}`", c, {
-            if is_default {
-                String::new()
-            } else {
-                format!(" --toolchain {}", toolchain)
-            }
-        }),
-        None => String::new(),
-    }
+    String::from_utf8(buf).unwrap()
 }

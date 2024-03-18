@@ -1,13 +1,23 @@
+use std::convert::Infallible;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::mpsc::{channel, Sender};
+use std::thread;
 
-use futures::sync::oneshot;
-use tempdir::TempDir;
+use http_body_util::Full;
+use hyper::body::Bytes;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::Request;
+use tempfile::TempDir;
 
 pub fn tmp_dir() -> TempDir {
-    TempDir::new("rustup-download-test-").expect("creating tempdir for test")
+    tempfile::Builder::new()
+        .prefix("rustup-download-test-")
+        .tempdir()
+        .expect("creating tempdir for test")
 }
 
 pub fn write_file(path: &Path, contents: &str) {
@@ -23,34 +33,59 @@ pub fn write_file(path: &Path, contents: &str) {
     file.sync_data().expect("writing test data");
 }
 
-pub fn serve_file(contents: Vec<u8>) -> SocketAddr {
-    use futures::Future;
-    use std::thread;
+// A dead simple hyper server implementation.
+// For more info, see:
+// https://hyper.rs/guides/1/server/hello-world/
+async fn run_server(addr_tx: Sender<SocketAddr>, addr: SocketAddr, contents: Vec<u8>) {
+    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+        let contents = contents.clone();
+        async move {
+            let res = serve_contents(req, contents);
+            Ok::<_, Infallible>(res)
+        }
+    });
 
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("can not bind");
+
+    let addr = listener.local_addr().unwrap();
+    addr_tx.send(addr).unwrap();
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("could not accept connection");
+        let io = hyper_util::rt::TokioIo::new(stream);
+
+        let svc = svc.clone();
+        tokio::spawn(async move {
+            if let Err(err) = http1::Builder::new().serve_connection(io, svc).await {
+                eprintln!("failed to serve connection: {:?}", err);
+            }
+        });
+    }
+}
+
+pub fn serve_file(contents: Vec<u8>) -> SocketAddr {
     let addr = ([127, 0, 0, 1], 0).into();
-    let (addr_tx, addr_rx) = oneshot::channel();
+    let (addr_tx, addr_rx) = channel();
 
     thread::spawn(move || {
-        // XXX: multiple clone below
-        fn serve(
-            contents: Vec<u8>,
-        ) -> impl Fn(hyper::Request<hyper::Body>) -> hyper::Response<hyper::Body> {
-            move |req| serve_contents(req, contents.clone())
-        }
-
-        let server = hyper::server::Server::bind(&addr)
-            .serve(move || hyper::service::service_fn_ok(serve(contents.clone())));
-        let addr = server.local_addr();
-        addr_tx.send(addr).unwrap();
-        hyper::rt::run(server.map_err(|e| panic!(e)));
+        let server = run_server(addr_tx, addr, contents);
+        let rt = tokio::runtime::Runtime::new().expect("could not creating Runtime");
+        rt.block_on(server);
     });
-    addr_rx.wait().unwrap()
+
+    let addr = addr_rx.recv();
+    addr.unwrap()
 }
 
 fn serve_contents(
-    req: hyper::Request<hyper::Body>,
+    req: hyper::Request<hyper::body::Incoming>,
     contents: Vec<u8>,
-) -> hyper::Response<hyper::Body> {
+) -> hyper::Response<Full<Bytes>> {
     let mut range_header = None;
     let (status, body) = if let Some(range) = req.headers().get(hyper::header::RANGE) {
         // extract range "bytes={start}-"
@@ -74,7 +109,7 @@ fn serve_contents(
     let mut res = hyper::Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_LENGTH, body.len())
-        .body(hyper::Body::from(body))
+        .body(Full::new(Bytes::from(body)))
         .unwrap();
     if let Some(range) = range_header {
         res.headers_mut()

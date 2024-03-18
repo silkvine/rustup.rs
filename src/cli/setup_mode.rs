@@ -1,12 +1,23 @@
-use crate::common;
-use crate::errors::*;
-use crate::self_update::{self, InstallOpts};
-use clap::{App, AppSettings, Arg};
-use rustup::dist::dist::TargetTriple;
-use std::env;
+use anyhow::Result;
+use clap::{builder::PossibleValuesParser, value_parser, Arg, ArgAction, Command};
 
-pub fn main() -> Result<()> {
-    let args: Vec<_> = env::args().collect();
+use crate::{
+    cli::{
+        common,
+        self_update::{self, InstallOpts},
+    },
+    currentprocess::{argsource::ArgSource, filesource::StdoutSource},
+    dist::dist::Profile,
+    process,
+    toolchain::names::MaybeOfficialToolchainName,
+    utils::utils,
+};
+
+#[cfg_attr(feature = "otel", tracing::instrument)]
+pub fn main() -> Result<utils::ExitCode> {
+    use clap::error::ErrorKind;
+
+    let args: Vec<_> = process().args().collect();
     let arg1 = args.get(1).map(|a| &**a);
 
     // Secret command used during self-update. Not for users.
@@ -16,61 +27,132 @@ pub fn main() -> Result<()> {
 
     // Internal testament dump used during CI.  Not for users.
     if arg1 == Some("--dump-testament") {
-        common::dump_testament();
-        return Ok(());
+        common::dump_testament()?;
+        return Ok(utils::ExitCode(0));
     }
 
-    // XXX: If you change anything here, please make the same changes in rustup-init.sh
-    let cli = App::new("rustup-init")
+    // NOTICE: If you change anything here, please make the same changes in rustup-init.sh
+    let cli = Command::new("rustup-init")
         .version(common::version())
+        .before_help(format!("rustup-init {}", common::version()))
         .about("The installer for rustup")
-        .setting(AppSettings::DeriveDisplayOrder)
         .arg(
-            Arg::with_name("verbose")
-                .short("v")
+            Arg::new("verbose")
+                .short('v')
                 .long("verbose")
-                .help("Enable verbose output"),
+                .help("Enable verbose output")
+                .action(ArgAction::SetTrue),
         )
         .arg(
-            Arg::with_name("no-prompt")
-                .short("y")
-                .help("Disable confirmation prompt."),
+            Arg::new("quiet")
+                .conflicts_with("verbose")
+                .short('q')
+                .long("quiet")
+                .help("Disable progress output")
+                .action(ArgAction::SetTrue),
         )
         .arg(
-            Arg::with_name("default-host")
+            Arg::new("no-prompt")
+                .short('y')
+                .help("Disable confirmation prompt.")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("default-host")
                 .long("default-host")
-                .takes_value(true)
+                .num_args(1)
                 .help("Choose a default host triple"),
         )
         .arg(
-            Arg::with_name("default-toolchain")
+            Arg::new("default-toolchain")
                 .long("default-toolchain")
-                .takes_value(true)
-                .help("Choose a default toolchain to install"),
+                .num_args(1)
+                .help("Choose a default toolchain to install. Use 'none' to not install any toolchains at all")
+                .value_parser(value_parser!(MaybeOfficialToolchainName))
         )
         .arg(
-            Arg::with_name("no-modify-path")
+            Arg::new("profile")
+                .long("profile")
+                .value_parser(PossibleValuesParser::new(Profile::names()))
+                .default_value(Profile::default_name()),
+        )
+        .arg(
+            Arg::new("components")
+                .help("Component name to also install")
+                .long("component")
+                .short('c')
+                .num_args(1..)
+                .use_value_delimiter(true)
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("targets")
+                .help("Target name to also install")
+                .long("target")
+                .short('t')
+                .num_args(1..)
+                .use_value_delimiter(true)
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("no-update-default-toolchain")
+                .long("no-update-default-toolchain")
+                .help("Don't update any existing default toolchain after install")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("no-modify-path")
                 .long("no-modify-path")
-                .help("Don't configure the PATH environment variable"),
+                .help("Don't configure the PATH environment variable")
+                .action(ArgAction::SetTrue),
         );
 
-    let matches = cli.get_matches();
-    let no_prompt = matches.is_present("no-prompt");
-    let verbose = matches.is_present("verbose");
+    let matches = match cli.try_get_matches_from(process().args_os()) {
+        Ok(matches) => matches,
+        Err(e) if [ErrorKind::DisplayHelp, ErrorKind::DisplayVersion].contains(&e.kind()) => {
+            write!(process().stdout().lock(), "{e}")?;
+            return Ok(utils::ExitCode(0));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let no_prompt = matches.get_flag("no-prompt");
+    let verbose = matches.get_flag("verbose");
+    let quiet = matches.get_flag("quiet");
     let default_host = matches
-        .value_of("default-host")
-        .map(std::borrow::ToOwned::to_owned)
-        .unwrap_or_else(|| TargetTriple::from_host_or_build().to_string());
-    let default_toolchain = matches.value_of("default-toolchain").unwrap_or("stable");
-    let no_modify_path = matches.is_present("no-modify-path");
+        .get_one::<String>("default-host")
+        .map(ToOwned::to_owned);
+    let default_toolchain = matches
+        .get_one::<MaybeOfficialToolchainName>("default-toolchain")
+        .map(ToOwned::to_owned);
+    let profile = matches
+        .get_one::<String>("profile")
+        .expect("Unreachable: Clap should supply a default");
+    let no_modify_path = matches.get_flag("no-modify-path");
+    let no_update_toolchain = matches.get_flag("no-update-default-toolchain");
+
+    let components: Vec<_> = matches
+        .get_many::<String>("components")
+        .map(|v| v.map(|s| &**s).collect())
+        .unwrap_or_else(Vec::new);
+
+    let targets: Vec<_> = matches
+        .get_many::<String>("targets")
+        .map(|v| v.map(|s| &**s).collect())
+        .unwrap_or_else(Vec::new);
 
     let opts = InstallOpts {
         default_host_triple: default_host,
-        default_toolchain: default_toolchain.to_owned(),
+        default_toolchain,
+        profile: profile.to_owned(),
         no_modify_path,
+        no_update_toolchain,
+        components: &components,
+        targets: &targets,
     };
 
-    self_update::install(no_prompt, verbose, opts)?;
+    if profile == "complete" {
+        warn!("{}", common::WARN_COMPLETE_PROFILE);
+    }
 
-    Ok(())
+    self_update::install(no_prompt, verbose, quiet, opts)
 }

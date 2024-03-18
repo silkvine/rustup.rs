@@ -1,21 +1,25 @@
-use crate::utils::raw;
-use std::error;
 use std::fmt::{self, Display};
 use std::fs;
 use std::io;
 use std::ops;
 use std::path::{Path, PathBuf};
 
+pub(crate) use anyhow::{Context, Result};
+use thiserror::Error as ThisError;
+
 use crate::utils::notify::NotificationLevel;
+use crate::utils::raw;
+use crate::utils::utils;
 
-#[derive(Debug)]
-pub enum Error {
-    CreatingRoot { path: PathBuf, error: io::Error },
-    CreatingFile { path: PathBuf, error: io::Error },
-    CreatingDirectory { path: PathBuf, error: io::Error },
+#[derive(Debug, ThisError)]
+pub(crate) enum CreatingError {
+    #[error("could not create temp root {}" ,.0.display())]
+    Root(PathBuf),
+    #[error("could not create temp file {}",.0.display())]
+    File(PathBuf),
+    #[error("could not create temp directory {}",.0.display())]
+    Directory(PathBuf),
 }
-
-pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Notification<'a> {
@@ -33,7 +37,7 @@ pub struct Cfg {
 }
 
 #[derive(Debug)]
-pub struct Dir<'a> {
+pub(crate) struct Dir<'a> {
     cfg: &'a Cfg,
     path: PathBuf,
 }
@@ -45,7 +49,7 @@ pub struct File<'a> {
 }
 
 impl<'a> Notification<'a> {
-    pub fn level(&self) -> NotificationLevel {
+    pub(crate) fn level(&self) -> NotificationLevel {
         use self::Notification::*;
         match self {
             CreatingRoot(_) | CreatingFile(_) | CreatingDirectory(_) => NotificationLevel::Verbose,
@@ -85,43 +89,6 @@ impl<'a> Display for Notification<'a> {
     }
 }
 
-impl error::Error for Error {
-    fn description(&self) -> &str {
-        use self::Error::*;
-        match self {
-            CreatingRoot { .. } => "could not create temp root",
-            CreatingFile { .. } => "could not create temp file",
-            CreatingDirectory { .. } => "could not create temp directory",
-        }
-    }
-
-    fn cause(&self) -> Option<&dyn error::Error> {
-        use self::Error::*;
-        match self {
-            CreatingRoot { error, .. }
-            | CreatingFile { error, .. }
-            | CreatingDirectory { error, .. } => Some(error),
-        }
-    }
-}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
-        use self::Error::*;
-        match self {
-            CreatingRoot { path, .. } => {
-                write!(f, "could not create temp root: {}", path.display())
-            }
-            CreatingFile { path, .. } => {
-                write!(f, "could not create temp file: {}", path.display())
-            }
-            CreatingDirectory { path, .. } => {
-                write!(f, "could not create temp directory: {}", path.display())
-            }
-        }
-    }
-}
-
 impl Cfg {
     pub fn new(
         root_directory: PathBuf,
@@ -135,17 +102,14 @@ impl Cfg {
         }
     }
 
-    pub fn create_root(&self) -> Result<bool> {
+    pub(crate) fn create_root(&self) -> Result<bool> {
         raw::ensure_dir_exists(&self.root_directory, |p| {
             (self.notify_handler)(Notification::CreatingRoot(p));
         })
-        .map_err(|e| Error::CreatingRoot {
-            path: PathBuf::from(&self.root_directory),
-            error: e,
-        })
+        .with_context(|| CreatingError::Root(PathBuf::from(&self.root_directory)))
     }
 
-    pub fn new_directory(&self) -> Result<Dir<'_>> {
+    pub(crate) fn new_directory(&self) -> Result<Dir<'_>> {
         self.create_root()?;
 
         loop {
@@ -157,10 +121,8 @@ impl Cfg {
             // random names at exactly the same time is... low.
             if !raw::path_exists(&temp_dir) {
                 (self.notify_handler)(Notification::CreatingDirectory(&temp_dir));
-                fs::create_dir(&temp_dir).map_err(|e| Error::CreatingDirectory {
-                    path: PathBuf::from(&temp_dir),
-                    error: e,
-                })?;
+                fs::create_dir(&temp_dir)
+                    .with_context(|| CreatingError::Directory(PathBuf::from(&temp_dir)))?;
                 return Ok(Dir {
                     cfg: self,
                     path: temp_dir,
@@ -173,7 +135,7 @@ impl Cfg {
         self.new_file_with_ext("", "")
     }
 
-    pub fn new_file_with_ext(&self, prefix: &str, ext: &str) -> Result<File<'_>> {
+    pub(crate) fn new_file_with_ext(&self, prefix: &str, ext: &str) -> Result<File<'_>> {
         self.create_root()?;
 
         loop {
@@ -185,16 +147,18 @@ impl Cfg {
             // random names at exactly the same time is... low.
             if !raw::path_exists(&temp_file) {
                 (self.notify_handler)(Notification::CreatingFile(&temp_file));
-                fs::File::create(&temp_file).map_err(|e| Error::CreatingFile {
-                    path: PathBuf::from(&temp_file),
-                    error: e,
-                })?;
+                fs::File::create(&temp_file)
+                    .with_context(|| CreatingError::File(PathBuf::from(&temp_file)))?;
                 return Ok(File {
                     cfg: self,
                     path: temp_file,
                 });
             }
         }
+    }
+
+    pub(crate) fn clean(&self) {
+        utils::delete_dir_contents(&self.root_directory);
     }
 }
 

@@ -145,6 +145,8 @@ if command == "dev-to-local":
 if command == "local-to-prod":
     run_s3cmd("aws s3 cp ./local-rustup/rustup-init.sh s3://{}/rustup/rustup-init.sh"
               .format(s3_bucket))
+    run_s3cmd("aws s3 cp ./local-rustup/rustup-init.sh s3://{}/rustup.sh"
+              .format(s3_bucket))
     run_s3cmd("aws s3 cp --recursive ./local-rustup/www/ s3://{}/rustup/www/"
               .format(s3_bucket))
     if live_run:
@@ -161,6 +163,9 @@ if command == "local-to-prod":
 if command == "update-dev-release" and live_run:
     run_s3cmd("aws cloudfront create-invalidation --distribution-id " +
               "E30AO2GXMDY230 --paths /rustup/*".format(s3_bucket))
+    # Invalidate dev.rustup.rs
+    run_s3cmd("aws cloudfront create-invalidation --distribution-id " +
+              "E3OQOQ34607Z0A --paths /*")
 if command == "update-prod-release" and live_run:
     run_s3cmd("aws cloudfront create-invalidation --distribution-id " +
               "E3NZU1LCBHH4A4 --paths /rustup/*".format(s3_bucket))

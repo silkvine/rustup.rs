@@ -1,36 +1,112 @@
 //! Installation and upgrade of both distribution-managed and local
 //! toolchains
+use std::path::{Path, PathBuf};
 
-use crate::dist::component::{Components, Package, TarGzPackage, Transaction};
-use crate::dist::dist;
-use crate::dist::download::DownloadCfg;
-use crate::dist::prefix::InstallPrefix;
-use crate::dist::temp;
-use crate::dist::Notification;
-use crate::errors::Result;
-use crate::utils::utils;
-use std::path::Path;
+use anyhow::Result;
 
-#[derive(Copy, Clone)]
-pub enum InstallMethod<'a> {
-    Copy(&'a Path),
-    Link(&'a Path),
-    Installer(&'a Path, &'a temp::Cfg),
-    // bool is whether to force an update
-    Dist(
-        &'a dist::ToolchainDesc,
-        Option<&'a Path>,
-        DownloadCfg<'a>,
-        bool,
-    ),
+use crate::{
+    config::Cfg,
+    dist::{dist, download::DownloadCfg, prefix::InstallPrefix, Notification},
+    errors::RustupError,
+    notifications::Notification as RootNotification,
+    toolchain::{
+        names::{CustomToolchainName, LocalToolchainName},
+        toolchain::Toolchain,
+    },
+    utils::utils,
+};
+
+#[derive(Clone, Debug)]
+pub(crate) enum UpdateStatus {
+    Installed,
+    Updated(String), // Stores the version of rustc *before* the update
+    Unchanged,
+}
+
+#[derive(Clone)]
+pub(crate) enum InstallMethod<'a> {
+    Copy {
+        src: &'a Path,
+        dest: &'a CustomToolchainName,
+        cfg: &'a Cfg,
+    },
+    Link {
+        src: &'a Path,
+        dest: &'a CustomToolchainName,
+        cfg: &'a Cfg,
+    },
+    Dist {
+        cfg: &'a Cfg,
+        desc: &'a dist::ToolchainDesc,
+        profile: dist::Profile,
+        update_hash: Option<&'a Path>,
+        dl_cfg: DownloadCfg<'a>,
+        /// --force bool is whether to force an update/install
+        force: bool,
+        /// --allow-downgrade
+        allow_downgrade: bool,
+        /// toolchain already exists
+        exists: bool,
+        /// currently installed date and version
+        old_date_version: Option<(String, String)>,
+        /// Extra components to install from dist
+        components: &'a [&'a str],
+        /// Extra targets to install from dist
+        targets: &'a [&'a str],
+    },
 }
 
 impl<'a> InstallMethod<'a> {
-    pub fn run(self, path: &Path, notify_handler: &dyn Fn(Notification<'_>)) -> Result<bool> {
+    // Install a toolchain
+    #[cfg_attr(feature = "otel", tracing::instrument(err, skip_all))]
+    pub(crate) fn install(&self) -> Result<UpdateStatus> {
+        let nh = self.cfg().notify_handler.clone();
+        match self {
+            InstallMethod::Copy { .. }
+            | InstallMethod::Link { .. }
+            | InstallMethod::Dist {
+                old_date_version: None,
+                ..
+            } => (nh)(RootNotification::InstallingToolchain(&self.dest_basename())),
+            _ => (nh)(RootNotification::UpdatingToolchain(&self.dest_basename())),
+        }
+
+        (self.cfg().notify_handler)(RootNotification::ToolchainDirectory(&self.dest_path()));
+        let updated = self.run(&self.dest_path(), &|n| {
+            (self.cfg().notify_handler)(n.into())
+        })?;
+
+        let status = match updated {
+            false => {
+                (nh)(RootNotification::UpdateHashMatches);
+                UpdateStatus::Unchanged
+            }
+            true => {
+                (nh)(RootNotification::InstalledToolchain(&self.dest_basename()));
+                match self {
+                    InstallMethod::Dist {
+                        old_date_version: Some((_, v)),
+                        ..
+                    } => UpdateStatus::Updated(v.clone()),
+                    InstallMethod::Copy { .. }
+                    | InstallMethod::Link { .. }
+                    | InstallMethod::Dist { .. } => UpdateStatus::Installed,
+                }
+            }
+        };
+
+        // Final check, to ensure we're installed
+        match Toolchain::exists(self.cfg(), &self.local_name())? {
+            true => Ok(status),
+            false => Err(RustupError::ToolchainNotInstallable(self.dest_basename()).into()),
+        }
+    }
+
+    fn run(&self, path: &Path, notify_handler: &dyn Fn(Notification<'_>)) -> Result<bool> {
         if path.exists() {
             // Don't uninstall first for Dist method
             match self {
-                InstallMethod::Dist(..) | InstallMethod::Installer(..) => {}
+                InstallMethod::Dist { .. } => {}
                 _ => {
                     uninstall(path, notify_handler)?;
                 }
@@ -38,28 +114,39 @@ impl<'a> InstallMethod<'a> {
         }
 
         match self {
-            InstallMethod::Copy(src) => {
+            InstallMethod::Copy { src, .. } => {
                 utils::copy_dir(src, path, notify_handler)?;
                 Ok(true)
             }
-            InstallMethod::Link(src) => {
-                utils::symlink_dir(src, &path, notify_handler)?;
+            InstallMethod::Link { src, .. } => {
+                utils::symlink_dir(src, path, notify_handler)?;
                 Ok(true)
             }
-            InstallMethod::Installer(src, temp_cfg) => {
-                InstallMethod::tar_gz(src, path, &temp_cfg, notify_handler)?;
-                Ok(true)
-            }
-            InstallMethod::Dist(toolchain, update_hash, dl_cfg, force_update) => {
+            InstallMethod::Dist {
+                desc,
+                profile,
+                update_hash,
+                dl_cfg,
+                force: force_update,
+                allow_downgrade,
+                exists,
+                old_date_version,
+                components,
+                targets,
+                ..
+            } => {
                 let prefix = &InstallPrefix::from(path.to_owned());
                 let maybe_new_hash = dist::update_from_dist(
-                    dl_cfg,
-                    update_hash,
-                    toolchain,
+                    *dl_cfg,
+                    update_hash.as_deref(),
+                    desc,
+                    if *exists { None } else { Some(*profile) },
                     prefix,
-                    &[],
-                    &[],
-                    force_update,
+                    *force_update,
+                    *allow_downgrade,
+                    old_date_version.as_ref().map(|dv| dv.0.as_str()),
+                    components,
+                    targets,
                 )?;
 
                 if let Some(hash) = maybe_new_hash {
@@ -75,35 +162,35 @@ impl<'a> InstallMethod<'a> {
         }
     }
 
-    fn tar_gz(
-        src: &Path,
-        path: &Path,
-        temp_cfg: &temp::Cfg,
-        notify_handler: &dyn Fn(Notification<'_>),
-    ) -> Result<()> {
-        notify_handler(Notification::Extracting(src, path));
-
-        let prefix = InstallPrefix::from(path.to_owned());
-        let installation = Components::open(prefix.clone())?;
-        let notification_converter = |notification: crate::utils::Notification<'_>| {
-            notify_handler(notification.into());
-        };
-        let reader = utils::FileReaderWithProgress::new_file(&src, &notification_converter)?;
-        let package: &dyn Package =
-            &TarGzPackage::new(reader, temp_cfg, Some(&notification_converter))?;
-
-        let mut tx = Transaction::new(prefix.clone(), temp_cfg, notify_handler);
-
-        for component in package.components() {
-            tx = package.install(&installation, &component, None, tx)?;
+    fn cfg(&self) -> &Cfg {
+        match self {
+            InstallMethod::Copy { cfg, .. } => cfg,
+            InstallMethod::Link { cfg, .. } => cfg,
+            InstallMethod::Dist { cfg, .. } => cfg,
         }
+    }
 
-        tx.commit();
+    fn local_name(&self) -> LocalToolchainName {
+        match self {
+            InstallMethod::Copy { dest, .. } => (*dest).into(),
+            InstallMethod::Link { dest, .. } => (*dest).into(),
+            InstallMethod::Dist { desc, .. } => (*desc).into(),
+        }
+    }
 
-        Ok(())
+    fn dest_basename(&self) -> String {
+        self.local_name().to_string()
+    }
+
+    fn dest_path(&self) -> PathBuf {
+        match self {
+            InstallMethod::Copy { cfg, dest, .. } => cfg.toolchain_path(&(*dest).into()),
+            InstallMethod::Link { cfg, dest, .. } => cfg.toolchain_path(&(*dest).into()),
+            InstallMethod::Dist { cfg, desc, .. } => cfg.toolchain_path(&(*desc).into()),
+        }
     }
 }
 
-pub fn uninstall(path: &Path, notify_handler: &dyn Fn(Notification<'_>)) -> Result<()> {
+pub(crate) fn uninstall(path: &Path, notify_handler: &dyn Fn(Notification<'_>)) -> Result<()> {
     utils::remove_dir("install", path, notify_handler)
 }

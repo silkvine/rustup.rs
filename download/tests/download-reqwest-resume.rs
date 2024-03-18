@@ -20,8 +20,14 @@ fn resume_partial_from_file_url() {
     write_file(&target_path, "123");
 
     let from_url = Url::from_file_path(&from_path).unwrap();
-    download_to_path_with_backend(Backend::Reqwest, &from_url, &target_path, true, None)
-        .expect("Test download failed");
+    download_to_path_with_backend(
+        Backend::Reqwest(TlsBackend::Default),
+        &from_url,
+        &target_path,
+        true,
+        None,
+    )
+    .expect("Test download failed");
 
     assert_eq!(std::fs::read_to_string(&target_path).unwrap(), "12345");
 }
@@ -34,14 +40,14 @@ fn callback_gets_all_data_as_if_the_download_happened_all_at_once() {
 
     let addr = serve_file(b"xxx45".to_vec());
 
-    let from_url = format!("http://{}", addr).parse().unwrap();
+    let from_url = format!("http://{addr}").parse().unwrap();
 
     let callback_partial = AtomicBool::new(false);
     let callback_len = Mutex::new(None);
     let received_in_callback = Mutex::new(Vec::new());
 
     download_to_path_with_backend(
-        Backend::Reqwest,
+        Backend::Reqwest(TlsBackend::Default),
         &from_url,
         &target_path,
         true,
@@ -58,7 +64,7 @@ fn callback_gets_all_data_as_if_the_download_happened_all_at_once() {
                 }
                 Event::DownloadDataReceived(data) => {
                     for b in data.iter() {
-                        received_in_callback.lock().unwrap().push(b.clone());
+                        received_in_callback.lock().unwrap().push(*b);
                     }
                 }
             }

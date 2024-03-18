@@ -4,6 +4,7 @@ use std::path::Path;
 use url::Url;
 
 use crate::utils::notify::NotificationLevel;
+use crate::utils::units::{self, Unit};
 
 #[derive(Debug)]
 pub enum Notification<'a> {
@@ -18,14 +19,19 @@ pub enum Notification<'a> {
     DownloadDataReceived(&'a [u8]),
     /// Download has finished.
     DownloadFinished,
-    /// This thins we're tracking is not counted in bytes.
+    /// The things we're tracking that are not counted in bytes.
     /// Must be paired with a pop-units; our other calls are not
     /// setup to guarantee this any better.
-    DownloadPushUnits(&'a str),
+    DownloadPushUnit(Unit),
     /// finish using an unusual unit.
-    DownloadPopUnits,
+    DownloadPopUnit,
     NoCanonicalPath(&'a Path),
     ResumingPartialDownload,
+    /// This would make more sense as a crate::notifications::Notification
+    /// member, but the notification callback is already narrowed to
+    /// utils::notifications by the time tar unpacking is called.
+    SetDefaultBufferSize(usize),
+    Error(String),
     UsingCurl,
     UsingReqwest,
     /// Renaming encountered a file in use error and is retrying.
@@ -37,9 +43,10 @@ pub enum Notification<'a> {
 }
 
 impl<'a> Notification<'a> {
-    pub fn level(&self) -> NotificationLevel {
+    pub(crate) fn level(&self) -> NotificationLevel {
         use self::Notification::*;
         match self {
+            SetDefaultBufferSize(_) => NotificationLevel::Debug,
             CreatingDirectory(_, _)
             | RemovingDirectory(_, _)
             | LinkingDirectory(_, _)
@@ -47,14 +54,15 @@ impl<'a> Notification<'a> {
             | DownloadingFile(_, _)
             | DownloadContentLengthReceived(_)
             | DownloadDataReceived(_)
-            | DownloadPushUnits(_)
-            | DownloadPopUnits
+            | DownloadPushUnit(_)
+            | DownloadPopUnit
             | DownloadFinished
             | ResumingPartialDownload
             | UsingCurl
             | UsingReqwest => NotificationLevel::Verbose,
             RenameInUse(_, _) => NotificationLevel::Info,
             NoCanonicalPath(_) => NotificationLevel::Warn,
+            Error(_) => NotificationLevel::Error,
         }
     }
 }
@@ -66,6 +74,7 @@ impl<'a> Display for Notification<'a> {
             CreatingDirectory(name, path) => {
                 write!(f, "creating {} directory: '{}'", name, path.display())
             }
+            Error(e) => write!(f, "error: '{e}'"),
             LinkingDirectory(_, dest) => write!(f, "linking directory from: '{}'", dest.display()),
             CopyingDirectory(src, _) => write!(f, "copying directory from: '{}'", src.display()),
             RemovingDirectory(name, path) => {
@@ -77,11 +86,16 @@ impl<'a> Display for Notification<'a> {
                 src.display(),
                 dest.display()
             ),
-            DownloadingFile(url, _) => write!(f, "downloading file from: '{}'", url),
-            DownloadContentLengthReceived(len) => write!(f, "download size is: '{}'", len),
+            SetDefaultBufferSize(size) => write!(
+                f,
+                "using up to {} of RAM to unpack components",
+                units::Size::new(*size, units::Unit::B, units::UnitMode::Norm)
+            ),
+            DownloadingFile(url, _) => write!(f, "downloading file from: '{url}'"),
+            DownloadContentLengthReceived(len) => write!(f, "download size is: '{len}'"),
             DownloadDataReceived(data) => write!(f, "received some data of size {}", data.len()),
-            DownloadPushUnits(_) => Ok(()),
-            DownloadPopUnits => Ok(()),
+            DownloadPushUnit(_) => Ok(()),
+            DownloadPopUnit => Ok(()),
             DownloadFinished => write!(f, "download finished"),
             NoCanonicalPath(path) => write!(f, "could not canonicalize path: '{}'", path.display()),
             ResumingPartialDownload => write!(f, "resuming partial download"),

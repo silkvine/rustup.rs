@@ -1,15 +1,17 @@
-use crate::dist::prefix::InstallPrefix;
-use crate::errors::*;
-/// The representation of the installed toolchain and its components.
-/// `Components` and `DirectoryPackage` are the two sides of the
-/// installation / uninstallation process.
-use crate::utils::utils;
+//! The representation of the installed toolchain and its components.
+//! `Components` and `DirectoryPackage` are the two sides of the
+//! installation / uninstallation process.
+
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Result};
 
 use crate::dist::component::package::{INSTALLER_VERSION, VERSION_FILE};
 use crate::dist::component::transaction::Transaction;
-
-use std::fs::File;
-use std::path::{Path, PathBuf};
+use crate::dist::prefix::InstallPrefix;
+use crate::errors::RustupError;
+use crate::utils::utils;
 
 const COMPONENTS_FILE: &str = "components";
 
@@ -25,7 +27,10 @@ impl Components {
         // Validate that the metadata uses a format we know
         if let Some(v) = c.read_version()? {
             if v != INSTALLER_VERSION {
-                return Err(ErrorKind::BadInstalledMetadataVersion(v).into());
+                bail!(
+                    "unsupported metadata version in existing installation: {}",
+                    v
+                );
             }
         }
 
@@ -35,7 +40,7 @@ impl Components {
         self.prefix.rel_manifest_file(COMPONENTS_FILE)
     }
     fn rel_component_manifest(&self, name: &str) -> PathBuf {
-        self.prefix.rel_manifest_file(&format!("manifest-{}", name))
+        self.prefix.rel_manifest_file(&format!("manifest-{name}"))
     }
     fn read_version(&self) -> Result<Option<String>> {
         let p = self.prefix.manifest_file(VERSION_FILE);
@@ -69,7 +74,7 @@ impl Components {
             })
             .collect())
     }
-    pub fn add<'a>(&self, name: &str, tx: Transaction<'a>) -> ComponentBuilder<'a> {
+    pub(crate) fn add<'a>(&self, name: &str, tx: Transaction<'a>) -> ComponentBuilder<'a> {
         ComponentBuilder {
             components: self.clone(),
             name: name.to_owned(),
@@ -81,12 +86,12 @@ impl Components {
         let result = self.list()?;
         Ok(result.into_iter().find(|c| (c.name() == name)))
     }
-    pub fn prefix(&self) -> InstallPrefix {
+    pub(crate) fn prefix(&self) -> InstallPrefix {
         self.prefix.clone()
     }
 }
 
-pub struct ComponentBuilder<'a> {
+pub(crate) struct ComponentBuilder<'a> {
     components: Components,
     name: String,
     parts: Vec<ComponentPart>,
@@ -94,36 +99,31 @@ pub struct ComponentBuilder<'a> {
 }
 
 impl<'a> ComponentBuilder<'a> {
-    pub fn add_file(&mut self, path: PathBuf) -> Result<File> {
-        self.parts
-            .push(ComponentPart("file".to_owned(), path.clone()));
-        self.tx.add_file(&self.name, path)
-    }
-    pub fn copy_file(&mut self, path: PathBuf, src: &Path) -> Result<()> {
+    pub(crate) fn copy_file(&mut self, path: PathBuf, src: &Path) -> Result<()> {
         self.parts
             .push(ComponentPart("file".to_owned(), path.clone()));
         self.tx.copy_file(&self.name, path, src)
     }
-    pub fn copy_dir(&mut self, path: PathBuf, src: &Path) -> Result<()> {
+    pub(crate) fn copy_dir(&mut self, path: PathBuf, src: &Path) -> Result<()> {
         self.parts
             .push(ComponentPart("dir".to_owned(), path.clone()));
         self.tx.copy_dir(&self.name, path, src)
     }
-    pub fn move_file(&mut self, path: PathBuf, src: &Path) -> Result<()> {
+    pub(crate) fn move_file(&mut self, path: PathBuf, src: &Path) -> Result<()> {
         self.parts
             .push(ComponentPart("file".to_owned(), path.clone()));
         self.tx.move_file(&self.name, path, src)
     }
-    pub fn move_dir(&mut self, path: PathBuf, src: &Path) -> Result<()> {
+    pub(crate) fn move_dir(&mut self, path: PathBuf, src: &Path) -> Result<()> {
         self.parts
             .push(ComponentPart("dir".to_owned(), path.clone()));
         self.tx.move_dir(&self.name, path, src)
     }
-    pub fn finish(mut self) -> Result<Transaction<'a>> {
+    pub(crate) fn finish(mut self) -> Result<Transaction<'a>> {
         // Write component manifest
         let path = self.components.rel_component_manifest(&self.name);
         let abs_path = self.components.prefix.abs_path(&path);
-        let mut file = self.tx.add_file(&self.name, path)?;
+        let mut file = BufWriter::new(self.tx.add_file(&self.name, path)?);
         for part in self.parts {
             // FIXME: This writes relative paths to the component manifest,
             // but rust-installer writes absolute paths.
@@ -147,10 +147,10 @@ impl<'a> ComponentBuilder<'a> {
 pub struct ComponentPart(pub String, pub PathBuf);
 
 impl ComponentPart {
-    pub fn encode(&self) -> String {
+    pub(crate) fn encode(&self) -> String {
         format!("{}:{}", &self.0, &self.1.to_string_lossy())
     }
-    pub fn decode(line: &str) -> Option<Self> {
+    pub(crate) fn decode(line: &str) -> Option<Self> {
         line.find(':')
             .map(|pos| Self(line[0..pos].to_owned(), PathBuf::from(&line[(pos + 1)..])))
     }
@@ -163,26 +163,26 @@ pub struct Component {
 }
 
 impl Component {
-    pub fn manifest_name(&self) -> String {
+    pub(crate) fn manifest_name(&self) -> String {
         format!("manifest-{}", &self.name)
     }
-    pub fn manifest_file(&self) -> PathBuf {
+    pub(crate) fn manifest_file(&self) -> PathBuf {
         self.components.prefix.manifest_file(&self.manifest_name())
     }
-    pub fn rel_manifest_file(&self) -> PathBuf {
+    pub(crate) fn rel_manifest_file(&self) -> PathBuf {
         self.components
             .prefix
             .rel_manifest_file(&self.manifest_name())
     }
-    pub fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         &self.name
     }
-    pub fn parts(&self) -> Result<Vec<ComponentPart>> {
+    pub(crate) fn parts(&self) -> Result<Vec<ComponentPart>> {
         let mut result = Vec::new();
         for line in utils::read_file("component", &self.manifest_file())?.lines() {
             result.push(
                 ComponentPart::decode(line)
-                    .ok_or_else(|| ErrorKind::CorruptComponent(self.name.clone()))?,
+                    .ok_or_else(|| RustupError::CorruptComponent(self.name.clone()))?,
             );
         }
         Ok(result)
@@ -192,7 +192,7 @@ impl Component {
         let path = self.components.rel_components_file();
         let abs_path = self.components.prefix.abs_path(&path);
         let temp = tx.temp().new_file()?;
-        utils::filter_file("components", &abs_path, &temp, |l| (l != self.name))?;
+        utils::filter_file("components", &abs_path, &temp, |l| l != self.name)?;
         tx.modify_file(path)?;
         utils::rename_file("components", &temp, &abs_path, tx.notify_handler())?;
 
@@ -303,7 +303,7 @@ impl Component {
             match &*part.0 {
                 "file" => tx.remove_file(&self.name, part.1.clone())?,
                 "dir" => tx.remove_dir(&self.name, part.1.clone())?,
-                _ => return Err(ErrorKind::CorruptComponent(self.name.clone()).into()),
+                _ => return Err(RustupError::CorruptComponent(self.name.clone()).into()),
             }
             pset.seen(part.1);
         }

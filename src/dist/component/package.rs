@@ -2,27 +2,28 @@
 //! for installing from a directory or tarball to an installation
 //! prefix, represented by a `Components` instance.
 
-use crate::diskio::{get_executor, Executor, Item, Kind};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::io::{self, ErrorKind as IOErrorKind, Read};
+use std::mem;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context, Result};
+use tar::EntryType;
+
+use crate::currentprocess::{filesource::StderrSource, varsource::VarSource};
+use crate::diskio::{get_executor, CompletedIo, Executor, FileBuffer, Item, Kind, IO_CHUNK_SIZE};
 use crate::dist::component::components::*;
 use crate::dist::component::transaction::*;
 use crate::dist::temp;
 use crate::errors::*;
+use crate::process;
 use crate::utils::notifications::Notification;
 use crate::utils::utils;
 
-use std::collections::{HashMap, HashSet};
-use std::env;
-use std::fmt;
-use std::io::{self, ErrorKind as IOErrorKind, Read};
-use std::iter::FromIterator;
-use std::mem;
-use std::path::{Path, PathBuf};
-
-use tar::EntryType;
-
 /// The current metadata revision used by rust-installer
-pub const INSTALLER_VERSION: &str = "3";
-pub const VERSION_FILE: &str = "rust-installer-version";
+pub(crate) const INSTALLER_VERSION: &str = "3";
+pub(crate) const VERSION_FILE: &str = "rust-installer-version";
 
 pub trait Package: fmt::Debug {
     fn contains(&self, component: &str, short_name: Option<&str>) -> bool;
@@ -66,7 +67,7 @@ fn validate_installer_version(path: &Path) -> Result<()> {
     if v == INSTALLER_VERSION {
         Ok(())
     } else {
-        Err(ErrorKind::BadInstallerVersion(v.to_owned()).into())
+        Err(anyhow!(format!("unsupported installer version: {v}")))
     }
 }
 
@@ -101,7 +102,7 @@ impl Package for DirectoryPackage {
 
         for l in manifest.lines() {
             let part = ComponentPart::decode(l)
-                .ok_or_else(|| ErrorKind::CorruptComponent(name.to_owned()))?;
+                .ok_or_else(|| RustupError::CorruptComponent(name.to_owned()))?;
 
             let path = part.1;
             let src_path = root.join(&path);
@@ -121,7 +122,7 @@ impl Package for DirectoryPackage {
                         builder.move_dir(path.clone(), &src_path)?
                     }
                 }
-                _ => return Err(ErrorKind::CorruptComponent(name.to_owned()).into()),
+                _ => return Err(RustupError::CorruptComponent(name.to_owned()).into()),
             }
         }
 
@@ -136,10 +137,11 @@ impl Package for DirectoryPackage {
 }
 
 #[derive(Debug)]
-pub struct TarPackage<'a>(DirectoryPackage, temp::Dir<'a>);
+#[allow(dead_code)] // temp::Dir is held for drop.
+pub(crate) struct TarPackage<'a>(DirectoryPackage, temp::Dir<'a>);
 
 impl<'a> TarPackage<'a> {
-    pub fn new<R: Read>(
+    pub(crate) fn new<R: Read>(
         stream: R,
         temp_cfg: &'a temp::Cfg,
         notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
@@ -149,7 +151,8 @@ impl<'a> TarPackage<'a> {
         // The rust-installer packages unpack to a directory called
         // $pkgname-$version-$target. Skip that directory when
         // unpacking.
-        unpack_without_first_dir(&mut archive, &*temp_dir, notify_handler)?;
+        unpack_without_first_dir(&mut archive, &temp_dir, notify_handler)
+            .context("failed to extract package")?;
 
         Ok(TarPackage(
             DirectoryPackage::new(temp_dir.to_owned(), false)?,
@@ -158,70 +161,84 @@ impl<'a> TarPackage<'a> {
     }
 }
 
-struct MemoryBudget {
-    limit: usize,
-    used: usize,
-}
-
 // Probably this should live in diskio but ¯\_(ツ)_/¯
-impl MemoryBudget {
-    fn new(max_file_size: usize) -> Self {
-        const DEFAULT_UNPACK_RAM: usize = 400 * 1024 * 1024;
-        let unpack_ram = if let Ok(budget_str) = env::var("RUSTUP_UNPACK_RAM") {
-            if let Ok(budget) = budget_str.parse::<usize>() {
-                budget
-            } else {
-                DEFAULT_UNPACK_RAM
-            }
+fn unpack_ram(
+    io_chunk_size: usize,
+    effective_max_ram: Option<usize>,
+    notify_handler: Option<&dyn Fn(Notification<'_>)>,
+) -> usize {
+    const RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS: usize = 200 * 1024 * 1024;
+    let minimum_ram = io_chunk_size * 2;
+    let default_max_unpack_ram = if let Some(effective_max_ram) = effective_max_ram {
+        if effective_max_ram > minimum_ram + RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS {
+            effective_max_ram - RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS
         } else {
-            DEFAULT_UNPACK_RAM
-        };
-        if max_file_size > unpack_ram {
-            panic!("RUSTUP_UNPACK_RAM must be larger than {}", max_file_size);
+            minimum_ram
         }
-        Self {
-            limit: unpack_ram,
-            used: 0,
+    } else {
+        // Rustup does not know how much RAM the machine has: use the minimum
+        minimum_ram
+    };
+    let unpack_ram = match process()
+        .var("RUSTUP_UNPACK_RAM")
+        .ok()
+        .and_then(|budget_str| budget_str.parse::<usize>().ok())
+    {
+        Some(budget) => {
+            if budget < minimum_ram {
+                warn!(
+                    "Ignoring RUSTUP_UNPACK_RAM ({}) less than minimum of {}.",
+                    budget, minimum_ram
+                );
+                minimum_ram
+            } else if budget > default_max_unpack_ram {
+                warn!(
+                    "Ignoring RUSTUP_UNPACK_RAM ({}) greater than detected available RAM of {}.",
+                    budget, default_max_unpack_ram
+                );
+                default_max_unpack_ram
+            } else {
+                budget
+            }
         }
-    }
-    fn reclaim(&mut self, op: &Item) {
-        match &op.kind {
-            Kind::Directory => {}
-            Kind::File(content) => self.used -= content.len(),
-        };
-    }
+        None => {
+            if let Some(h) = notify_handler {
+                h(Notification::SetDefaultBufferSize(default_max_unpack_ram))
+            }
+            default_max_unpack_ram
+        }
+    };
 
-    fn claim(&mut self, op: &Item) {
-        match &op.kind {
-            Kind::Directory => {}
-            Kind::File(content) => self.used += content.len(),
-        };
-    }
-
-    fn available(&self) -> usize {
-        self.limit - self.used
+    if minimum_ram > unpack_ram {
+        panic!("RUSTUP_UNPACK_RAM must be larger than {minimum_ram}");
+    } else {
+        unpack_ram
     }
 }
 
 /// Handle the async result of io operations
 /// Replaces op.result with Ok(())
-fn filter_result(op: &mut Item) -> io::Result<()> {
-    let result = mem::replace(&mut op.result, Ok(()));
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) => match e.kind() {
-            IOErrorKind::AlreadyExists => {
-                // mkdir of e.g. ~/.rustup already existing is just fine;
-                // for others it would be better to know whether it is
-                // expected to exist or not -so put a flag in the state.
-                if let Kind::Directory = op.kind {
-                    Ok(())
-                } else {
-                    Err(e)
+fn filter_result(op: &mut CompletedIo) -> io::Result<()> {
+    if let CompletedIo::Item(op) = op {
+        let result = mem::replace(&mut op.result, Ok(()));
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => match e.kind() {
+                IOErrorKind::AlreadyExists => {
+                    // mkdir of e.g. ~/.rustup already existing is just fine;
+                    // for others it would be better to know whether it is
+                    // expected to exist or not -so put a flag in the state.
+                    if let Kind::Directory = op.kind {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
                 }
-            }
-            _ => Err(e),
-        },
+                _ => Err(e),
+            },
+        }
+    } else {
+        Ok(())
     }
 }
 
@@ -230,32 +247,33 @@ fn filter_result(op: &mut Item) -> io::Result<()> {
 ///
 /// Currently the volume of queued items does not count as backpressure against
 /// the main tar extraction process.
+/// Returns the number of triggered children
 fn trigger_children(
-    io_executor: &mut dyn Executor,
+    io_executor: &dyn Executor,
     directories: &mut HashMap<PathBuf, DirStatus>,
-    budget: &mut MemoryBudget,
-    item: Item,
+    op: CompletedIo,
 ) -> Result<usize> {
     let mut result = 0;
-    if let Kind::Directory = item.kind {
-        let mut pending = Vec::new();
-        directories
-            .entry(item.full_path)
-            .and_modify(|status| match status {
-                DirStatus::Exists => unreachable!(),
-                DirStatus::Pending(pending_inner) => {
-                    pending.append(pending_inner);
-                    *status = DirStatus::Exists;
+    if let CompletedIo::Item(item) = op {
+        if let Kind::Directory = item.kind {
+            let mut pending = Vec::new();
+            directories
+                .entry(item.full_path)
+                .and_modify(|status| match status {
+                    DirStatus::Exists => unreachable!(),
+                    DirStatus::Pending(pending_inner) => {
+                        pending.append(pending_inner);
+                        *status = DirStatus::Exists;
+                    }
+                })
+                .or_insert_with(|| unreachable!());
+            result += pending.len();
+            for pending_item in pending.into_iter() {
+                for mut item in io_executor.execute(pending_item).collect::<Vec<_>>() {
+                    // TODO capture metrics
+                    filter_result(&mut item)?;
+                    result += trigger_children(io_executor, directories, item)?;
                 }
-            })
-            .or_insert_with(|| unreachable!());
-        result += pending.len();
-        for pending_item in pending.into_iter() {
-            for mut item in Vec::from_iter(io_executor.execute(pending_item)) {
-                // TODO capture metrics
-                budget.reclaim(&item);
-                filter_result(&mut item).chain_err(|| ErrorKind::ExtractingPackage)?;
-                result += trigger_children(io_executor, directories, budget, item)?;
             }
         }
     };
@@ -268,17 +286,23 @@ enum DirStatus {
     Pending(Vec<Item>),
 }
 
-fn unpack_without_first_dir<'a, R: Read>(
+fn unpack_without_first_dir<R: Read>(
     archive: &mut tar::Archive<R>,
     path: &Path,
-    notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
+    notify_handler: Option<&dyn Fn(Notification<'_>)>,
 ) -> Result<()> {
-    let mut io_executor: Box<dyn Executor> = get_executor(notify_handler);
-    let entries = archive
-        .entries()
-        .chain_err(|| ErrorKind::ExtractingPackage)?;
-    const MAX_FILE_SIZE: u64 = 100_000_000;
-    let mut budget = MemoryBudget::new(MAX_FILE_SIZE as usize);
+    let entries = archive.entries()?;
+    let effective_max_ram = match effective_limits::memory_limit() {
+        Ok(ram) => Some(ram as usize),
+        Err(e) => {
+            if let Some(h) = notify_handler {
+                h(Notification::Error(e.to_string()))
+            }
+            None
+        }
+    };
+    let unpack_ram = unpack_ram(IO_CHUNK_SIZE, effective_max_ram, notify_handler);
+    let mut io_executor: Box<dyn Executor> = get_executor(notify_handler, unpack_ram)?;
 
     let mut directories: HashMap<PathBuf, DirStatus> = HashMap::new();
     // Path is presumed to exist. Call it a precondition.
@@ -288,52 +312,84 @@ fn unpack_without_first_dir<'a, R: Read>(
         // drain completed results to keep memory pressure low and respond
         // rapidly to completed events even if we couldn't submit work (because
         // our unpacked item is pending dequeue)
-        for mut item in Vec::from_iter(io_executor.completed()) {
+        for mut item in io_executor.completed().collect::<Vec<_>>() {
             // TODO capture metrics
-            budget.reclaim(&item);
-            filter_result(&mut item).chain_err(|| ErrorKind::ExtractingPackage)?;
-            trigger_children(&mut *io_executor, &mut directories, &mut budget, item)?;
+            filter_result(&mut item)?;
+            trigger_children(&*io_executor, &mut directories, item)?;
         }
 
-        let mut entry = entry.chain_err(|| ErrorKind::ExtractingPackage)?;
+        let mut entry = entry?;
         let relpath = {
             let path = entry.path();
-            let path = path.chain_err(|| ErrorKind::ExtractingPackage)?;
+            let path = path?;
             path.into_owned()
         };
-        // Reject path components that are not normal (.|..|/| etc)
+        // Reject path components that are not normal (..|/| etc)
         for part in relpath.components() {
             match part {
-                std::path::Component::Normal(_) => {}
-                _ => return Err(ErrorKind::BadPath(relpath).into()),
+                // Some very early rust tarballs include a "." segment which we have to
+                // support, despite not liking it.
+                std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                _ => bail!(format!("tar path '{}' is not supported", relpath.display())),
             }
         }
         let mut components = relpath.components();
         // Throw away the first path component: our root was supplied.
         components.next();
-        let full_path = path.join(&components.as_path());
+        let full_path = path.join(components.as_path());
         if full_path == path {
             // The tmp dir code makes the root dir for us.
             continue;
         }
 
-        let size = entry.header().size()?;
-        if size > MAX_FILE_SIZE {
-            return Err(format!("File too big {} {}", relpath.display(), size).into());
+        struct SenderEntry<'a, 'b, R: std::io::Read> {
+            sender: Box<dyn FnMut(FileBuffer) -> bool + 'a>,
+            entry: tar::Entry<'b, R>,
         }
-        while size > budget.available() as u64 {
-            for mut item in Vec::from_iter(io_executor.completed()) {
+
+        /// true if either no sender_entry was provided, or the incremental file
+        /// has been fully dispatched.
+        fn flush_ios<R: std::io::Read, P: AsRef<Path>>(
+            io_executor: &mut dyn Executor,
+            directories: &mut HashMap<PathBuf, DirStatus>,
+            mut sender_entry: Option<&mut SenderEntry<'_, '_, R>>,
+            full_path: P,
+        ) -> Result<bool> {
+            let mut result = sender_entry.is_none();
+            for mut op in io_executor.completed().collect::<Vec<_>>() {
                 // TODO capture metrics
-                budget.reclaim(&item);
-                filter_result(&mut item).chain_err(|| ErrorKind::ExtractingPackage)?;
-                trigger_children(&mut *io_executor, &mut directories, &mut budget, item)?;
+                filter_result(&mut op)?;
+                trigger_children(&*io_executor, directories, op)?;
             }
+            // Maybe stream a file incrementally
+            if let Some(sender) = sender_entry.as_mut() {
+                if io_executor.buffer_available(IO_CHUNK_SIZE) {
+                    let mut buffer = io_executor.get_buffer(IO_CHUNK_SIZE);
+                    let len = sender
+                        .entry
+                        .by_ref()
+                        .take(IO_CHUNK_SIZE as u64)
+                        .read_to_end(&mut buffer)?;
+                    buffer = buffer.finished();
+                    if len == 0 {
+                        result = true;
+                    }
+                    if !(sender.sender)(buffer) {
+                        bail!(format!(
+                            "IO receiver for '{}' disconnected",
+                            full_path.as_ref().display()
+                        ))
+                    }
+                }
+            }
+            Ok(result)
         }
+
         // Bail out if we get hard links, device nodes or any other unusual content
         // - it is most likely an attack, as rusts cross-platform nature precludes
         // such artifacts
         let kind = entry.header().entry_type();
-        // https://github.com/rust-lang/rustup.rs/issues/1140 and before that
+        // https://github.com/rust-lang/rustup/issues/1140 and before that
         // https://github.com/rust-lang/rust/issues/25479
         // tl;dr: code got convoluted and we *may* have damaged tarballs out
         // there.
@@ -357,19 +413,42 @@ fn unpack_without_first_dir<'a, R: Read>(
         let o_mode = g_mode >> 3;
         let mode = u_mode | g_mode | o_mode;
 
+        let file_size = entry.header().size()?;
+        let size = std::cmp::min(IO_CHUNK_SIZE as u64, file_size);
+
+        while !io_executor.buffer_available(size as usize) {
+            flush_ios::<tar::Entry<'_, R>, _>(
+                &mut *io_executor,
+                &mut directories,
+                None,
+                &full_path,
+            )?;
+        }
+
+        let mut incremental_file_sender: Option<Box<dyn FnMut(FileBuffer) -> bool + '_>> = None;
         let mut item = match kind {
             EntryType::Directory => {
                 directories.insert(full_path.to_owned(), DirStatus::Pending(Vec::new()));
-                Item::make_dir(full_path, mode)
+                Item::make_dir(full_path.clone(), mode)
             }
             EntryType::Regular => {
-                let mut v = Vec::with_capacity(size as usize);
-                entry.read_to_end(&mut v)?;
-                Item::write_file(full_path, v, mode)
+                if file_size > IO_CHUNK_SIZE as u64 {
+                    let (item, sender) = Item::write_file_segmented(
+                        full_path.clone(),
+                        mode,
+                        io_executor.incremental_file_state(),
+                    )?;
+                    incremental_file_sender = Some(sender);
+                    item
+                } else {
+                    let mut content = io_executor.get_buffer(size as usize);
+                    entry.read_to_end(&mut content)?;
+                    content = content.finished();
+                    Item::write_file(full_path.clone(), mode, content)
+                }
             }
-            _ => return Err(ErrorKind::UnsupportedKind(format!("{:?}", kind)).into()),
+            _ => bail!(format!("tar entry kind '{kind:?}' is not supported")),
         };
-        budget.claim(&item);
 
         let item = loop {
             // Create the full path to the entry if it does not exist already
@@ -378,23 +457,30 @@ fn unpack_without_first_dir<'a, R: Read>(
                     None => {
                         // Tar has item before containing directory
                         // Complain about this so we can see if these exist.
-                        eprintln!(
+                        writeln!(
+                            process().stderr().lock(),
                             "Unexpected: missing parent '{}' for '{}'",
                             parent.display(),
                             entry.path()?.display()
-                        );
+                        )?;
                         directories.insert(parent.to_owned(), DirStatus::Pending(vec![item]));
                         item = Item::make_dir(parent.to_owned(), 0o755);
                         // Check the parent's parent
                         continue;
                     }
                     Some(DirStatus::Exists) => {
-                        break item;
+                        break Some(item);
                     }
                     Some(DirStatus::Pending(pending)) => {
-                        // Parent dir is being made, take next item from tar
+                        // Parent dir is being made
                         pending.push(item);
-                        continue 'entries;
+                        if incremental_file_sender.is_none() {
+                            // take next item from tar
+                            continue 'entries;
+                        } else {
+                            // don't submit a new item for processing, but do be ready to feed data to the incremental file.
+                            break None;
+                        }
                     }
                 }
             } else {
@@ -403,22 +489,37 @@ fn unpack_without_first_dir<'a, R: Read>(
             }
         };
 
-        for mut item in Vec::from_iter(io_executor.execute(item)) {
-            // TODO capture metrics
-            budget.reclaim(&item);
-            filter_result(&mut item).chain_err(|| ErrorKind::ExtractingPackage)?;
-            trigger_children(&mut *io_executor, &mut directories, &mut budget, item)?;
+        if let Some(item) = item {
+            // Submit the new item
+            for mut item in io_executor.execute(item).collect::<Vec<_>>() {
+                // TODO capture metrics
+                filter_result(&mut item)?;
+                trigger_children(&*io_executor, &mut directories, item)?;
+            }
         }
+
+        let mut incremental_file_sender =
+            incremental_file_sender.map(|incremental_file_sender| SenderEntry {
+                sender: incremental_file_sender,
+                entry,
+            });
+
+        // monitor io queue and feed in the content of the file (if needed)
+        while !flush_ios(
+            &mut *io_executor,
+            &mut directories,
+            incremental_file_sender.as_mut(),
+            &full_path,
+        )? {}
     }
 
     loop {
         let mut triggered = 0;
-        for mut item in Vec::from_iter(io_executor.join()) {
+        for mut item in io_executor.join().collect::<Vec<_>>() {
             // handle final IOs
             // TODO capture metrics
-            budget.reclaim(&item);
-            filter_result(&mut item).chain_err(|| ErrorKind::ExtractingPackage)?;
-            triggered += trigger_children(&mut *io_executor, &mut directories, &mut budget, item)?;
+            filter_result(&mut item)?;
+            triggered += trigger_children(&*io_executor, &mut directories, item)?;
         }
         if triggered == 0 {
             // None of the IO submitted before the prior join triggered any new
@@ -449,10 +550,10 @@ impl<'a> Package for TarPackage<'a> {
 }
 
 #[derive(Debug)]
-pub struct TarGzPackage<'a>(TarPackage<'a>);
+pub(crate) struct TarGzPackage<'a>(TarPackage<'a>);
 
 impl<'a> TarGzPackage<'a> {
-    pub fn new<R: Read>(
+    pub(crate) fn new<R: Read>(
         stream: R,
         temp_cfg: &'a temp::Cfg,
         notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
@@ -485,10 +586,10 @@ impl<'a> Package for TarGzPackage<'a> {
 }
 
 #[derive(Debug)]
-pub struct TarXzPackage<'a>(TarPackage<'a>);
+pub(crate) struct TarXzPackage<'a>(TarPackage<'a>);
 
 impl<'a> TarXzPackage<'a> {
-    pub fn new<R: Read>(
+    pub(crate) fn new<R: Read>(
         stream: R,
         temp_cfg: &'a temp::Cfg,
         notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
@@ -503,6 +604,42 @@ impl<'a> TarXzPackage<'a> {
 }
 
 impl<'a> Package for TarXzPackage<'a> {
+    fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
+        self.0.contains(component, short_name)
+    }
+    fn install<'b>(
+        &self,
+        target: &Components,
+        component: &str,
+        short_name: Option<&str>,
+        tx: Transaction<'b>,
+    ) -> Result<Transaction<'b>> {
+        self.0.install(target, component, short_name, tx)
+    }
+    fn components(&self) -> Vec<String> {
+        self.0.components()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TarZStdPackage<'a>(TarPackage<'a>);
+
+impl<'a> TarZStdPackage<'a> {
+    pub(crate) fn new<R: Read>(
+        stream: R,
+        temp_cfg: &'a temp::Cfg,
+        notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
+    ) -> Result<Self> {
+        let stream = zstd::stream::read::Decoder::new(stream)?;
+        Ok(TarZStdPackage(TarPackage::new(
+            stream,
+            temp_cfg,
+            notify_handler,
+        )?))
+    }
+}
+
+impl<'a> Package for TarZStdPackage<'a> {
     fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
         self.0.contains(component, short_name)
     }

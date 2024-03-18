@@ -1,52 +1,28 @@
-FROM ubuntu:18.04
-USER root
+FROM rust-android
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    ca-certificates \
-    cmake \
-    curl \
-    gcc \
-    libc6-dev \
-    make \
-    pkg-config
-
-COPY ci/docker/scripts/sccache.sh /scripts/
-RUN sh /scripts/sccache.sh
-
-RUN apt-get install -y --no-install-recommends \
-    unzip \
-    python && \
-    curl -O https://dl.google.com/android/repository/android-ndk-r13b-linux-x86_64.zip && \
-    unzip -q android-ndk-r13b-linux-x86_64.zip && \
-    ./android-ndk-r13b/build/tools/make_standalone_toolchain.py \
-        --install-dir /android-ndk/arm \
-        --arch arm \
-        --api 21 && \
-    ./android-ndk-r13b/build/tools/make_standalone_toolchain.py \
-        --install-dir /android-ndk/arm64 \
-        --arch arm64 \
-        --api 21 && \
-    ./android-ndk-r13b/build/tools/make_standalone_toolchain.py \
-        --install-dir /android-ndk/x86 \
-        --arch x86 \
-        --api 21 && \
-    ./android-ndk-r13b/build/tools/make_standalone_toolchain.py \
-        --install-dir /android-ndk/x86_64 \
-        --arch x86_64 \
-        --api 21 && \
-    rm -rf ./android-ndk-r13b-linux-x86_64.zip ./android-ndk-r13b && \
-    apt-get purge --auto-remove -y unzip python
-
-ENV PATH=$PATH:/android-ndk/arm/bin
-ENV PATH=$PATH:/android-ndk/arm64/bin
-ENV PATH=$PATH:/android-ndk/x86/bin
-ENV PATH=$PATH:/android-ndk/x86_64/bin
-
-ENV CARGO_TARGET_ARM_LINUX_ANDROIDEABI_LINKER=arm-linux-androideabi-gcc
-ENV CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=arm-linux-androideabi-gcc
-ENV CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android-gcc
-ENV CARGO_TARGET_I686_LINUX_ANDROID_LINKER=i686-linux-android-gcc
-ENV CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=x86_64-linux-android-gcc
-
-WORKDIR /buildslave
+ENV PATH=$PATH:/android/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin \
+    AR_arm_linux_androideabi=llvm-ar \
+    AR_armv7_linux_androideabi=llvm-ar \
+    AR_aarch64_linux_android=llvm-ar \
+    AR_i686_linux_android=llvm-ar \
+    AR_x86_64_linux_android=llvm-ar \
+    RANLIB_arm_linux_androideabi=llvm-ranlib \
+    RANLIB_armv7_linux_androideabi=llvm-ranlib \
+    RANLIB_aarch64_linux_android=llvm-ranlib \
+    RANLIB_i686_linux_android=llvm-ranlib \
+    RANLIB_x86_64_linux_android=llvm-ranlib \
+    CC_arm_linux_androideabi=armv7a-linux-androideabi21-clang \
+    CC_armv7_linux_androideabi=armv7a-linux-androideabi21-clang \
+    CC_aarch64_linux_android=aarch64-linux-android21-clang \
+    CC_i686_linux_android=i686-linux-android21-clang \
+    CC_x86_64_linux_android=x86_64-linux-android21-clang \
+    CXX_arm_linux_androideabi=armv7a-linux-androideabi21-clang++ \
+    CXX_armv7_linux_androideabi=armv7a-linux-androideabi21-clang++ \
+    CXX_aarch64_linux_android=aarch64-linux-android21-clang++ \
+    CXX_i686_linux_android=i686-linux-android21-clang++ \
+    CXX_x86_64_linux_android=x86_64-linux-android21-clang++ \
+    CARGO_TARGET_ARM_LINUX_ANDROIDEABI_LINKER=armv7a-linux-androideabi21-clang \
+    CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=armv7a-linux-androideabi21-clang \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android21-clang \
+    CARGO_TARGET_I686_LINUX_ANDROID_LINKER=i686-linux-android21-clang \
+    CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=x86_64-linux-android21-clang

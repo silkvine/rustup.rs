@@ -2,6 +2,7 @@
 
 var platforms = ["default", "unknown", "win32", "win64", "unix"];
 var platform_override = null;
+var rustup_install_command = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh";
 
 function detect_platform() {
     "use strict";
@@ -22,6 +23,7 @@ function detect_platform() {
     if (navigator.platform == "Linux ppc64") {os = "unix";}
     if (navigator.platform == "Linux mips") {os = "unix";}
     if (navigator.platform == "Linux mips64") {os = "unix";}
+    if (navigator.platform == "Linux riscv64") {os = "unix";}
     if (navigator.platform == "Mac") {os = "unix";}
     if (navigator.platform == "Win32") {os = "win32";}
     if (navigator.platform == "Win64" ||
@@ -31,6 +33,7 @@ function detect_platform() {
     if (navigator.platform == "FreeBSD amd64") {os = "unix";}
     if (navigator.platform == "NetBSD x86_64") {os = "unix";}
     if (navigator.platform == "NetBSD amd64") {os = "unix";}
+    if (navigator.platform == "SunOS i86pc") {os = "unix";}
 
     // I wish I knew by now, but I don't. Try harder.
     if (os == "unknown") {
@@ -48,9 +51,21 @@ function detect_platform() {
         if (navigator.oscpu.indexOf("Linux")!=-1) {os = "unix";}
         if (navigator.oscpu.indexOf("FreeBSD")!=-1) {os = "unix";}
         if (navigator.oscpu.indexOf("NetBSD")!=-1) {os = "unix";}
+        if (navigator.oscpu.indexOf("SunOS")!=-1) {os = "unix";}
     }
 
     return os;
+}
+
+function vis(elem, value) {
+    var possible = ["block", "inline", "none"];
+    for (var i = 0; i < possible.length; i++) {
+        if (possible[i] === value) {
+            elem.classList.add("display-" + possible[i]);
+        } else {
+            elem.classList.remove("display-" + possible[i]);
+        }
+    }
 }
 
 function adjust_for_platform() {
@@ -60,9 +75,9 @@ function adjust_for_platform() {
 
     platforms.forEach(function (platform_elem) {
         var platform_div = document.getElementById("platform-instructions-" + platform_elem);
-        platform_div.style.display = "none";
+        vis(platform_div, "none");
         if (platform == platform_elem) {
-            platform_div.style.display = "block";
+            vis(platform_div, "block");
         }
     });
 
@@ -81,15 +96,15 @@ function adjust_platform_specific_instrs(platform) {
         }
         if (platform == "win64" || platform == "win32") {
             if (el_is_not_win) {
-                el.style.display = "none";
+                vis(el, "none");
             } else {
-                el.style.display = el_visible_style;
+                vis(el, el_visible_style);
             }
         } else {
             if (el_is_not_win) {
-                el.style.display = el_visible_style;
+                vis(el, el_visible_style);
             } else {
-                el.style.display = "none";
+                vis(el, "none");
             }
         }
     }
@@ -121,7 +136,7 @@ function set_up_cycle_button() {
             idx += 1;
 
             if (idx == key.length) {
-                cycle_button.style.display = "block";
+                vis(cycle_button, "block");
                 unlocked = true;
                 cycle_platform();
             }
@@ -153,9 +168,50 @@ function fill_in_bug_report_values() {
     nav_app.textContent = navigator.appVersion;
 }
 
+function process_copy_button_click(id) {
+    try {
+        navigator.clipboard.writeText(rustup_install_command).then(() =>
+          document.getElementById(id).style.opacity = '1');
+
+        setTimeout(() => document.getElementById(id).style.opacity = '0', 3000);
+    } catch (e) {
+        console.log('Hit a snag when copying to clipboard: ', e);
+    }
+}
+
+function handle_copy_button_click(e) {
+    switch (e.id) {
+        case 'copy-button-unix':
+            process_copy_button_click('copy-status-message-unix');
+            break;
+        case 'copy-button-win32':
+            process_copy_button_click('copy-status-message-win32');
+            break;
+        case 'copy-button-win64':
+            process_copy_button_click('copy-status-message-win64');
+            break;
+        case 'copy-button-unknown':
+            process_copy_button_click('copy-status-message-unknown');
+            break;
+        case 'copy-button-default':
+            process_copy_button_click('copy-status-message-default');
+            break;
+    }
+}
+
+function set_up_copy_button_clicks() {
+    var buttons = document.querySelectorAll(".copy-button");
+    buttons.forEach(function (element) {
+        element.addEventListener('click', function() {
+            handle_copy_button_click(element);
+        });
+    })
+}
+
 (function () {
     adjust_for_platform();
     set_up_cycle_button();
     set_up_default_platform_buttons();
+    set_up_copy_button_clicks();
     fill_in_bug_report_values();
 }());

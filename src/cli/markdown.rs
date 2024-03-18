@@ -1,22 +1,22 @@
 // Write Markdown to the terminal
+use std::io::Write;
 
-use crate::term2::{color, Attr, Terminal};
-use markdown::tokenize;
-use markdown::{Block, ListItem, Span};
-use std::io;
+use pulldown_cmark::{Event, Tag, TagEnd};
+
+use crate::currentprocess::terminalsource::{Attr, Color, ColorableTerminal};
 
 // Handles the wrapping of text written to the console
-struct LineWrapper<'a, T: Terminal> {
+struct LineWrapper<'a> {
     indent: u32,
     margin: u32,
     pos: u32,
-    pub w: &'a mut T,
+    w: &'a mut ColorableTerminal,
 }
 
-impl<'a, T: Terminal + 'a> LineWrapper<'a, T> {
+impl<'a> LineWrapper<'a> {
     // Just write a newline
     fn write_line(&mut self) {
-        let _ = writeln!(self.w);
+        let _ = writeln!(self.w.lock());
         // Reset column position to start of line
         self.pos = 0;
     }
@@ -25,7 +25,7 @@ impl<'a, T: Terminal + 'a> LineWrapper<'a, T> {
         if self.pos == 0 {
             // Write a space for each level of indent
             for _ in 0..self.indent {
-                let _ = write!(self.w, " ");
+                let _ = write!(self.w.lock(), " ");
             }
             self.pos = self.indent;
         }
@@ -47,7 +47,7 @@ impl<'a, T: Terminal + 'a> LineWrapper<'a, T> {
         }
 
         // Write the word
-        let _ = write!(self.w, "{}", word);
+        let _ = write!(self.w.lock(), "{word}");
         self.pos += word_len;
     }
     fn write_space(&mut self) {
@@ -72,8 +72,15 @@ impl<'a, T: Terminal + 'a> LineWrapper<'a, T> {
             self.write_word(word);
         }
     }
+    // Writes code block where each line is indented
+    fn write_code_block(&mut self, text: &str) {
+        for line in text.lines() {
+            self.write_word(line); // Will call write_indent()
+            self.write_line();
+        }
+    }
     // Constructor
-    fn new(w: &'a mut T, indent: u32, margin: u32) -> Self {
+    fn new(w: &'a mut ColorableTerminal, indent: u32, margin: u32) -> Self {
         LineWrapper {
             indent,
             margin,
@@ -84,14 +91,16 @@ impl<'a, T: Terminal + 'a> LineWrapper<'a, T> {
 }
 
 // Handles the formatting of text
-struct LineFormatter<'a, T: Terminal + io::Write> {
-    wrapper: LineWrapper<'a, T>,
+struct LineFormatter<'a> {
+    is_code_block: bool,
+    wrapper: LineWrapper<'a>,
     attrs: Vec<Attr>,
 }
 
-impl<'a, T: Terminal + io::Write + 'a> LineFormatter<'a, T> {
-    fn new(w: &'a mut T, indent: u32, margin: u32) -> Self {
+impl<'a> LineFormatter<'a> {
+    fn new(w: &'a mut ColorableTerminal, indent: u32, margin: u32) -> Self {
         LineFormatter {
+            is_code_block: false,
             wrapper: LineWrapper::new(w, indent, margin),
             attrs: Vec::new(),
         }
@@ -107,78 +116,117 @@ impl<'a, T: Terminal + io::Write + 'a> LineFormatter<'a, T> {
             let _ = self.wrapper.w.attr(*attr);
         }
     }
-    fn do_spans(&mut self, spans: Vec<Span>) {
-        for span in spans {
-            match span {
-                Span::Break => {}
-                Span::Text(text) => {
-                    self.wrapper.write_span(&text);
-                }
-                Span::Code(code) => {
-                    self.push_attr(Attr::Bold);
-                    self.wrapper.write_word(&code);
-                    self.pop_attr();
-                }
-                Span::Emphasis(spans) => {
-                    self.push_attr(Attr::ForegroundColor(color::BRIGHT_RED));
-                    self.do_spans(spans);
-                    self.pop_attr();
-                }
-                _ => {}
+
+    fn start_tag(&mut self, tag: Tag<'a>) {
+        match tag {
+            Tag::Paragraph => {
+                self.wrapper.write_line();
             }
-        }
-    }
-    fn do_block(&mut self, b: Block) {
-        match b {
-            Block::Header(spans, _) => {
+            Tag::Heading { .. } => {
                 self.push_attr(Attr::Bold);
                 self.wrapper.write_line();
-                self.do_spans(spans);
+            }
+            Tag::MetadataBlock(_) => {}
+            Tag::Table(_alignments) => {}
+            Tag::TableHead => {}
+            Tag::TableRow => {}
+            Tag::TableCell => {}
+            Tag::BlockQuote => {}
+            Tag::CodeBlock(_) | Tag::HtmlBlock { .. } => {
+                self.wrapper.write_line();
+                self.wrapper.indent += 2;
+                self.is_code_block = true;
+            }
+            Tag::List(_) => {
+                self.wrapper.write_line();
+                self.wrapper.indent += 2;
+            }
+            Tag::Item => {
+                self.wrapper.write_line();
+            }
+            Tag::Emphasis => {
+                self.push_attr(Attr::ForegroundColor(Color::Red));
+            }
+            Tag::Strong => {}
+            Tag::Strikethrough => {}
+            Tag::Link { .. } => {}
+            Tag::Image { .. } => {}
+            Tag::FootnoteDefinition(_name) => {}
+        }
+    }
+
+    fn end_tag(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph => {
+                self.wrapper.write_line();
+            }
+            TagEnd::Heading { .. } => {
                 self.wrapper.write_line();
                 self.pop_attr();
             }
-            Block::CodeBlock(code) => {
-                self.wrapper.write_line();
-                self.wrapper.indent += 2;
-                for line in code.lines() {
-                    // Don't word-wrap code lines
-                    self.wrapper.write_word(line);
-                    self.wrapper.write_line();
-                }
+            TagEnd::Table => {}
+            TagEnd::TableHead => {}
+            TagEnd::TableRow => {}
+            TagEnd::TableCell => {}
+            TagEnd::BlockQuote => {}
+            TagEnd::CodeBlock | TagEnd::HtmlBlock => {
+                self.is_code_block = false;
                 self.wrapper.indent -= 2;
             }
-            Block::Paragraph(spans) => {
-                self.wrapper.write_line();
-                self.do_spans(spans);
+            TagEnd::List(_) => {
+                self.wrapper.indent -= 2;
                 self.wrapper.write_line();
             }
-            Block::UnorderedList(items) => {
-                self.wrapper.write_line();
-                for item in items {
-                    self.wrapper.indent += 2;
-                    match item {
-                        ListItem::Simple(spans) => {
-                            self.do_spans(spans);
-                        }
-                        ListItem::Paragraph(blocks) => {
-                            for block in blocks {
-                                self.do_block(block);
-                            }
-                        }
-                    }
-                    self.wrapper.write_line();
-                    self.wrapper.indent -= 2;
+            TagEnd::Item => {}
+            TagEnd::Emphasis => {
+                self.pop_attr();
+            }
+            TagEnd::Strong => {}
+            TagEnd::Strikethrough => {}
+            TagEnd::Link { .. } => {}
+            TagEnd::Image { .. } => {} // shouldn't happen, handled in start
+            TagEnd::FootnoteDefinition => {}
+            TagEnd::MetadataBlock(_) => {}
+        }
+    }
+
+    fn process_event(&mut self, event: Event<'a>) {
+        use self::Event::*;
+        match event {
+            Start(tag) => self.start_tag(tag),
+            End(tag) => self.end_tag(tag),
+            Text(text) => {
+                if self.is_code_block {
+                    self.wrapper.write_code_block(&text);
+                } else {
+                    self.wrapper.write_span(&text);
                 }
             }
-            _ => {}
+            Code(code) => {
+                self.push_attr(Attr::Bold);
+                self.wrapper.write_word(&code);
+                self.pop_attr();
+            }
+            Html(_html) => {}
+            SoftBreak => {
+                self.wrapper.write_line();
+            }
+            HardBreak => {
+                self.wrapper.write_line();
+            }
+            Rule => {}
+            FootnoteReference(_name) => {}
+            TaskListMarker(true) => {}
+            TaskListMarker(false) => {}
+            InlineHtml(_) => {}
         }
     }
 }
 
-pub fn md<'a, S: AsRef<str>, T: Terminal + io::Write + 'a>(t: &'a mut T, content: S) {
+pub(crate) fn md<S: AsRef<str>>(t: &mut ColorableTerminal, content: S) {
     let mut f = LineFormatter::new(t, 0, 79);
-    let blocks = tokenize(content.as_ref());
-    for b in blocks {
-        f.do_block(b);
+    let parser = pulldown_cmark::Parser::new(content.as_ref());
+    for event in parser {
+        f.process_event(event);
     }
 }

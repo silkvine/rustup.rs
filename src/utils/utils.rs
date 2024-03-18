@@ -1,25 +1,26 @@
-use crate::errors::*;
-use crate::utils::notifications::Notification;
-use crate::utils::raw;
-use sha2::Sha256;
-use std::cmp::Ord;
 use std::env;
-use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use url::Url;
 
+use anyhow::{anyhow, bail, Context, Result};
+use home::env as home;
 use retry::delay::{jitter, Fibonacci};
 use retry::{retry, OperationResult};
+use sha2::Sha256;
+use url::Url;
 
-#[cfg(windows)]
-use winapi::shared::minwindef::DWORD;
+use crate::currentprocess::{cwdsource::CurrentDirSource, varsource::VarSource};
+use crate::errors::*;
+use crate::utils::notifications::Notification;
+use crate::utils::raw;
+use crate::{home_process, process};
 
-pub use crate::utils::utils::raw::{
-    find_cmd, has_cmd, if_not_empty, is_directory, is_file, path_exists, prefix_arg, random_string,
-};
+#[cfg(not(windows))]
+pub(crate) use crate::utils::utils::raw::find_cmd;
+pub(crate) use crate::utils::utils::raw::{if_not_empty, is_directory};
+
+pub use crate::utils::utils::raw::{is_file, path_exists};
 
 pub struct ExitCode(pub i32);
 
@@ -34,42 +35,47 @@ where
     raw::ensure_dir_exists(path, |_| {
         notify_handler(Notification::CreatingDirectory(name, path).into())
     })
-    .chain_err(|| ErrorKind::CreatingDirectory {
+    .with_context(|| RustupError::CreatingDirectory {
         name,
         path: PathBuf::from(path),
     })
 }
 
 pub fn read_file(name: &'static str, path: &Path) -> Result<String> {
-    fs::read_to_string(path).chain_err(|| ErrorKind::ReadingFile {
+    fs::read_to_string(path).with_context(|| RustupError::ReadingFile {
         name,
         path: PathBuf::from(path),
     })
 }
 
 pub fn write_file(name: &'static str, path: &Path, contents: &str) -> Result<()> {
-    raw::write_file(path, contents).chain_err(|| ErrorKind::WritingFile {
+    raw::write_file(path, contents).with_context(|| RustupError::WritingFile {
         name,
         path: PathBuf::from(path),
     })
 }
 
-pub fn append_file(name: &'static str, path: &Path, line: &str) -> Result<()> {
-    raw::append_file(path, line).chain_err(|| ErrorKind::WritingFile {
+pub(crate) fn append_file(name: &'static str, path: &Path, line: &str) -> Result<()> {
+    raw::append_file(path, line).with_context(|| RustupError::WritingFile {
         name,
         path: PathBuf::from(path),
     })
 }
 
-pub fn write_line(name: &'static str, file: &mut File, path: &Path, line: &str) -> Result<()> {
-    writeln!(file, "{}", line).chain_err(|| ErrorKind::WritingFile {
+pub(crate) fn write_line(
+    name: &'static str,
+    mut file: impl Write,
+    path: &Path,
+    line: &str,
+) -> Result<()> {
+    writeln!(file, "{line}").with_context(|| RustupError::WritingFile {
         name,
         path: path.to_path_buf(),
     })
 }
 
-pub fn write_str(name: &'static str, file: &mut File, path: &Path, s: &str) -> Result<()> {
-    write!(file, "{}", s).chain_err(|| ErrorKind::WritingFile {
+pub(crate) fn write_str(name: &'static str, file: &mut File, path: &Path, s: &str) -> Result<()> {
+    write!(file, "{s}").with_context(|| RustupError::WritingFile {
         name,
         path: path.to_path_buf(),
     })
@@ -87,7 +93,7 @@ where
     rename(name, src, dest, notify)
 }
 
-pub fn rename_dir<'a, N>(
+pub(crate) fn rename_dir<'a, N>(
     name: &'static str,
     src: &'a Path,
     dest: &'a Path,
@@ -99,31 +105,23 @@ where
     rename(name, src, dest, notify)
 }
 
-pub fn filter_file<F: FnMut(&str) -> bool>(
+pub(crate) fn filter_file<F: FnMut(&str) -> bool>(
     name: &'static str,
     src: &Path,
     dest: &Path,
     filter: F,
 ) -> Result<usize> {
-    raw::filter_file(src, dest, filter).chain_err(|| ErrorKind::FilteringFile {
-        name,
-        src: PathBuf::from(src),
-        dest: PathBuf::from(dest),
+    raw::filter_file(src, dest, filter).with_context(|| {
+        format!(
+            "could not copy {} file from '{}' to '{}'",
+            name,
+            src.display(),
+            dest.display()
+        )
     })
 }
 
-pub fn match_file<T, F: FnMut(&str) -> Option<T>>(
-    name: &'static str,
-    src: &Path,
-    f: F,
-) -> Result<Option<T>> {
-    raw::match_file(src, f).chain_err(|| ErrorKind::ReadingFile {
-        name,
-        path: PathBuf::from(src),
-    })
-}
-
-pub fn canonicalize_path<'a, N>(path: &'a Path, notify_handler: &dyn Fn(N)) -> PathBuf
+pub(crate) fn canonicalize_path<'a, N>(path: &'a Path, notify_handler: &dyn Fn(N)) -> PathBuf
 where
     N: From<Notification<'a>>,
 {
@@ -133,46 +131,44 @@ where
     })
 }
 
-pub fn tee_file<W: io::Write>(name: &'static str, path: &Path, w: &mut W) -> Result<()> {
-    raw::tee_file(path, w).chain_err(|| ErrorKind::ReadingFile {
-        name,
-        path: PathBuf::from(path),
-    })
-}
-
 pub fn download_file(
     url: &Url,
     path: &Path,
     hasher: Option<&mut Sha256>,
     notify_handler: &dyn Fn(Notification<'_>),
 ) -> Result<()> {
-    download_file_with_resume(&url, &path, hasher, false, &notify_handler)
+    download_file_with_resume(url, path, hasher, false, &notify_handler)
 }
 
-pub fn download_file_with_resume(
+pub(crate) fn download_file_with_resume(
     url: &Url,
     path: &Path,
     hasher: Option<&mut Sha256>,
     resume_from_partial: bool,
     notify_handler: &dyn Fn(Notification<'_>),
 ) -> Result<()> {
-    use download::ErrorKind as DEK;
+    use download::DownloadError as DEK;
     match download_file_(url, path, hasher, resume_from_partial, notify_handler) {
         Ok(_) => Ok(()),
         Err(e) => {
-            let is_client_error = match e.kind() {
-                ErrorKind::Download(DEK::HttpStatus(400..=499)) => true,
-                ErrorKind::Download(DEK::FileNotFound) => true,
+            if e.downcast_ref::<std::io::Error>().is_some() {
+                return Err(e);
+            }
+            let is_client_error = match e.downcast_ref::<DEK>() {
+                // Specifically treat the bad partial range error as not our
+                // fault in case it was something odd which happened.
+                Some(DEK::HttpStatus(416)) => false,
+                Some(DEK::HttpStatus(400..=499)) | Some(DEK::FileNotFound) => true,
                 _ => false,
             };
-            Err(e).chain_err(|| {
+            Err(e).with_context(|| {
                 if is_client_error {
-                    ErrorKind::DownloadNotExists {
+                    RustupError::DownloadNotExists {
                         url: url.clone(),
                         path: path.to_path_buf(),
                     }
                 } else {
-                    ErrorKind::DownloadingFile {
+                    RustupError::DownloadingFile {
                         url: url.clone(),
                         path: path.to_path_buf(),
                     }
@@ -190,7 +186,7 @@ fn download_file_(
     notify_handler: &dyn Fn(Notification<'_>),
 ) -> Result<()> {
     use download::download_to_path_with_backend;
-    use download::{Backend, Event};
+    use download::{Backend, Event, TlsBackend};
     use sha2::Digest;
     use std::cell::RefCell;
 
@@ -203,7 +199,7 @@ fn download_file_(
     let callback: &dyn Fn(Event<'_>) -> download::Result<()> = &|msg| {
         if let Event::DownloadDataReceived(data) = msg {
             if let Some(h) = hasher.borrow_mut().as_mut() {
-                h.input(data);
+                h.update(data);
             }
         }
 
@@ -224,125 +220,151 @@ fn download_file_(
 
     // Download the file
 
-    // Keep the hyper env var around for a bit
-    let use_curl_backend = env::var_os("RUSTUP_USE_CURL").is_some();
+    // Keep the curl env var around for a bit
+    let use_curl_backend = process().var_os("RUSTUP_USE_CURL").is_some();
+    let use_rustls = process().var_os("RUSTUP_USE_RUSTLS").is_some();
     let (backend, notification) = if use_curl_backend {
         (Backend::Curl, Notification::UsingCurl)
     } else {
-        (Backend::Reqwest, Notification::UsingReqwest)
+        let tls_backend = if use_rustls {
+            TlsBackend::Rustls
+        } else {
+            #[cfg(feature = "reqwest-default-tls")]
+            {
+                TlsBackend::Default
+            }
+            #[cfg(not(feature = "reqwest-default-tls"))]
+            {
+                TlsBackend::Rustls
+            }
+        };
+        (Backend::Reqwest(tls_backend), Notification::UsingReqwest)
     };
     notify_handler(notification);
-    download_to_path_with_backend(backend, url, path, resume_from_partial, Some(callback))?;
+    let res =
+        download_to_path_with_backend(backend, url, path, resume_from_partial, Some(callback));
 
     notify_handler(Notification::DownloadFinished);
 
-    Ok(())
+    res
 }
 
-pub fn parse_url(url: &str) -> Result<Url> {
-    Url::parse(url).chain_err(|| format!("failed to parse url: {}", url))
+pub(crate) fn parse_url(url: &str) -> Result<Url> {
+    Url::parse(url).with_context(|| format!("failed to parse url: {url}"))
 }
 
-pub fn cmd_status(name: &'static str, cmd: &mut Command) -> Result<()> {
-    raw::cmd_status(cmd).chain_err(|| ErrorKind::RunningCommand {
-        name: OsString::from(name),
-    })
-}
-
-pub fn assert_is_file(path: &Path) -> Result<()> {
+pub(crate) fn assert_is_file(path: &Path) -> Result<()> {
     if !is_file(path) {
-        Err(ErrorKind::NotAFile {
-            path: PathBuf::from(path),
-        }
-        .into())
+        Err(anyhow!(format!("not a file: '{}'", path.display())))
     } else {
         Ok(())
     }
 }
 
-pub fn assert_is_directory(path: &Path) -> Result<()> {
+pub(crate) fn assert_is_directory(path: &Path) -> Result<()> {
     if !is_directory(path) {
-        Err(ErrorKind::NotADirectory {
-            path: PathBuf::from(path),
-        }
-        .into())
+        Err(anyhow!(format!("not a directory: '{}'", path.display())))
     } else {
         Ok(())
     }
 }
 
-pub fn symlink_dir<'a, N>(src: &'a Path, dest: &'a Path, notify_handler: &dyn Fn(N)) -> Result<()>
+pub(crate) fn symlink_dir<'a, N>(
+    src: &'a Path,
+    dest: &'a Path,
+    notify_handler: &dyn Fn(N),
+) -> Result<()>
 where
     N: From<Notification<'a>>,
 {
     notify_handler(Notification::LinkingDirectory(src, dest).into());
-    raw::symlink_dir(src, dest).chain_err(|| ErrorKind::LinkingDirectory {
-        src: PathBuf::from(src),
-        dest: PathBuf::from(dest),
+    raw::symlink_dir(src, dest).with_context(|| {
+        format!(
+            "could not create link from '{}' to '{}'",
+            src.display(),
+            dest.display()
+        )
     })
 }
 
-pub fn hard_or_symlink_file(src: &Path, dest: &Path) -> Result<()> {
-    if hardlink_file(src, dest).is_err() {
+pub(crate) fn hard_or_symlink_file(src: &Path, dest: &Path) -> Result<()> {
+    // Some mac filesystems can do hardlinks to symlinks, some can't.
+    // See rust-lang/rustup#3136 for why it's better never to use them.
+    #[cfg(target_os = "macos")]
+    let force_symlink = fs::symlink_metadata(src)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    #[cfg(not(target_os = "macos"))]
+    let force_symlink = false;
+    if force_symlink || hardlink_file(src, dest).is_err() {
         symlink_file(src, dest)?;
     }
     Ok(())
 }
 
 pub fn hardlink_file(src: &Path, dest: &Path) -> Result<()> {
-    raw::hardlink(src, dest).chain_err(|| ErrorKind::LinkingFile {
+    raw::hardlink(src, dest).with_context(|| RustupError::LinkingFile {
         src: PathBuf::from(src),
         dest: PathBuf::from(dest),
     })
 }
 
 #[cfg(unix)]
-pub fn symlink_file(src: &Path, dest: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(src, dest).chain_err(|| ErrorKind::LinkingFile {
+fn symlink_file(src: &Path, dest: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(src, dest).with_context(|| RustupError::LinkingFile {
         src: PathBuf::from(src),
         dest: PathBuf::from(dest),
     })
 }
 
 #[cfg(windows)]
-pub fn symlink_file(src: &Path, dest: &Path) -> Result<()> {
+fn symlink_file(src: &Path, dest: &Path) -> Result<()> {
     // we are supposed to not use symlink on windows
-    Err(ErrorKind::LinkingFile {
+    Err(anyhow!(RustupError::LinkingFile {
         src: PathBuf::from(src),
         dest: PathBuf::from(dest),
-    }
-    .into())
+    }))
 }
 
-pub fn copy_dir<'a, N>(src: &'a Path, dest: &'a Path, notify_handler: &dyn Fn(N)) -> Result<()>
+pub(crate) fn copy_dir<'a, N>(
+    src: &'a Path,
+    dest: &'a Path,
+    notify_handler: &dyn Fn(N),
+) -> Result<()>
 where
     N: From<Notification<'a>>,
 {
     notify_handler(Notification::CopyingDirectory(src, dest).into());
-    raw::copy_dir(src, dest).chain_err(|| ErrorKind::CopyingDirectory {
-        src: PathBuf::from(src),
-        dest: PathBuf::from(dest),
+    raw::copy_dir(src, dest).with_context(|| {
+        format!(
+            "could not copy directory from '{}' to '{}'",
+            src.display(),
+            dest.display()
+        )
     })
 }
 
-pub fn copy_file(src: &Path, dest: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(src).chain_err(|| ErrorKind::ReadingFile {
+pub(crate) fn copy_file(src: &Path, dest: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(src).with_context(|| RustupError::ReadingFile {
         name: "metadata for",
         path: PathBuf::from(src),
     })?;
     if metadata.file_type().is_symlink() {
-        symlink_file(&src, dest).map(|_| ())
+        symlink_file(src, dest).map(|_| ())
     } else {
         fs::copy(src, dest)
-            .chain_err(|| ErrorKind::CopyingFile {
-                src: PathBuf::from(src),
-                dest: PathBuf::from(dest),
+            .with_context(|| {
+                format!(
+                    "could not copy file from '{}' to '{}'",
+                    src.display(),
+                    dest.display()
+                )
             })
             .map(|_| ())
     }
 }
 
-pub fn remove_dir<'a, N>(
+pub(crate) fn remove_dir<'a, N>(
     name: &'static str,
     path: &'a Path,
     notify_handler: &dyn Fn(N),
@@ -351,58 +373,82 @@ where
     N: From<Notification<'a>>,
 {
     notify_handler(Notification::RemovingDirectory(name, path).into());
-    raw::remove_dir(path).chain_err(|| ErrorKind::RemovingDirectory {
+    raw::remove_dir(path).with_context(|| RustupError::RemovingDirectory {
         name,
         path: PathBuf::from(path),
     })
 }
 
 pub fn remove_file(name: &'static str, path: &Path) -> Result<()> {
-    fs::remove_file(path).chain_err(|| ErrorKind::RemovingFile {
+    // Most files we go to remove won't ever be in use. Some, like proxies, may
+    // be for indefinite periods, and this will mean we are slower to error and
+    // have the user fix the issue. Others, like the setup binary, are
+    // transiently in use, and this wait loop will fix the issue transparently
+    // for a rare performance hit.
+    retry(
+        Fibonacci::from_millis(1).map(jitter).take(10),
+        || match fs::remove_file(path) {
+            Ok(()) => OperationResult::Ok(()),
+            Err(e) => match e.kind() {
+                io::ErrorKind::PermissionDenied => OperationResult::Retry(e),
+                _ => OperationResult::Err(e),
+            },
+        },
+    )
+    .with_context(|| RustupError::RemovingFile {
         name,
         path: PathBuf::from(path),
     })
 }
 
-pub fn ensure_file_removed(name: &'static str, path: &Path) -> Result<()> {
-    let result = fs::remove_file(path);
+pub(crate) fn ensure_file_removed(name: &'static str, path: &Path) -> Result<()> {
+    let result = remove_file(name, path);
     if let Err(err) = &result {
-        if err.kind() == io::ErrorKind::NotFound {
-            return Ok(());
+        if let Some(retry::Error { error: e, .. }) = err.downcast_ref::<retry::Error<io::Error>>() {
+            if e.kind() == io::ErrorKind::NotFound {
+                return Ok(());
+            }
         }
     }
-    result.chain_err(|| ErrorKind::RemovingFile {
+    result.with_context(|| RustupError::RemovingFile {
         name,
         path: PathBuf::from(path),
     })
 }
 
-pub fn read_dir(name: &'static str, path: &Path) -> Result<fs::ReadDir> {
-    fs::read_dir(path).chain_err(|| ErrorKind::ReadingDirectory {
+pub(crate) fn read_dir(name: &'static str, path: &Path) -> Result<fs::ReadDir> {
+    fs::read_dir(path).with_context(|| RustupError::ReadingDirectory {
         name,
         path: PathBuf::from(path),
     })
 }
 
-pub fn open_browser(path: &Path) -> Result<()> {
-    opener::open(path).chain_err(|| "couldn't open browser")
+pub(crate) fn open_browser(path: &Path) -> Result<()> {
+    opener::open_browser(path).context("couldn't open browser")
 }
 
-pub fn set_permissions(path: &Path, perms: fs::Permissions) -> Result<()> {
-    fs::set_permissions(path, perms).chain_err(|| ErrorKind::SettingPermissions {
-        path: PathBuf::from(path),
+#[cfg(not(windows))]
+fn set_permissions(path: &Path, perms: fs::Permissions) -> Result<()> {
+    fs::set_permissions(path, perms).map_err(|e| {
+        RustupError::SettingPermissions {
+            p: PathBuf::from(path),
+            source: e,
+        }
+        .into()
     })
 }
 
 pub fn file_size(path: &Path) -> Result<u64> {
-    let metadata = fs::metadata(path).chain_err(|| ErrorKind::ReadingFile {
-        name: "metadata for",
-        path: PathBuf::from(path),
-    })?;
-    Ok(metadata.len())
+    Ok(fs::metadata(path)
+        .with_context(|| RustupError::ReadingFile {
+            name: "metadata for",
+            path: PathBuf::from(path),
+        })?
+        .len())
 }
 
-pub fn make_executable(path: &Path) -> Result<()> {
+pub(crate) fn make_executable(path: &Path) -> Result<()> {
+    #[allow(clippy::unnecessary_wraps)]
     #[cfg(windows)]
     fn inner(_: &Path) -> Result<()> {
         Ok(())
@@ -411,8 +457,9 @@ pub fn make_executable(path: &Path) -> Result<()> {
     fn inner(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let metadata = fs::metadata(path).chain_err(|| ErrorKind::SettingPermissions {
-            path: PathBuf::from(path),
+        let metadata = fs::metadata(path).map_err(|e| RustupError::SettingPermissions {
+            p: PathBuf::from(path),
+            source: e,
         })?;
         let mut perms = metadata.permissions();
         let mode = perms.mode();
@@ -431,146 +478,40 @@ pub fn make_executable(path: &Path) -> Result<()> {
 }
 
 pub fn current_dir() -> Result<PathBuf> {
-    env::current_dir().chain_err(|| ErrorKind::LocatingWorkingDir)
+    process()
+        .current_dir()
+        .context(RustupError::LocatingWorkingDir)
 }
 
 pub fn current_exe() -> Result<PathBuf> {
-    env::current_exe().chain_err(|| ErrorKind::LocatingWorkingDir)
+    env::current_exe().context(RustupError::LocatingWorkingDir)
 }
 
-pub fn to_absolute<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
+pub(crate) fn to_absolute<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
     current_dir().map(|mut v| {
         v.push(path);
         v
     })
 }
 
-// On windows, unlike std and cargo, rustup does *not* consider the
-// HOME variable. If it did then the install dir would change
-// depending on whether you happened to install under msys.
-#[cfg(windows)]
-pub fn home_dir() -> Option<PathBuf> {
-    use std::ptr;
-    use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
-    use winapi::um::errhandlingapi::GetLastError;
-    use winapi::um::handleapi::CloseHandle;
-    use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
-    use winapi::um::userenv::GetUserProfileDirectoryW;
-    use winapi::um::winnt::TOKEN_READ;
-
-    std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .or_else(|| unsafe {
-            let me = GetCurrentProcess();
-            let mut token = ptr::null_mut();
-            if OpenProcessToken(me, TOKEN_READ, &mut token) == 0 {
-                return None;
-            }
-            let _g = scopeguard::guard(token, |h| {
-                let _ = CloseHandle(h);
-            });
-            fill_utf16_buf(
-                |buf, mut sz| {
-                    match GetUserProfileDirectoryW(token, buf, &mut sz) {
-                        0 if GetLastError() != ERROR_INSUFFICIENT_BUFFER => 0,
-                        0 => sz,
-                        _ => sz - 1, // sz includes the null terminator
-                    }
-                },
-                os2path,
-            )
-            .ok()
-        })
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    home::home_dir_with_env(&home_process())
 }
 
-#[cfg(windows)]
-fn os2path(s: &[u16]) -> PathBuf {
-    use std::os::windows::ffi::OsStringExt;
-    PathBuf::from(OsString::from_wide(s))
-}
-
-#[cfg(windows)]
-fn fill_utf16_buf<F1, F2, T>(mut f1: F1, f2: F2) -> io::Result<T>
-where
-    F1: FnMut(*mut u16, DWORD) -> DWORD,
-    F2: FnOnce(&[u16]) -> T,
-{
-    use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
-    use winapi::um::errhandlingapi::{GetLastError, SetLastError};
-
-    // Start off with a stack buf but then spill over to the heap if we end up
-    // needing more space.
-    let mut stack_buf = [0u16; 512];
-    let mut heap_buf = Vec::new();
-    unsafe {
-        let mut n = stack_buf.len();
-        loop {
-            let buf = if n <= stack_buf.len() {
-                &mut stack_buf[..]
-            } else {
-                let extra = n - heap_buf.len();
-                heap_buf.reserve(extra);
-                heap_buf.set_len(n);
-                &mut heap_buf[..]
-            };
-
-            // This function is typically called on windows API functions which
-            // will return the correct length of the string, but these functions
-            // also return the `0` on error. In some cases, however, the
-            // returned "correct length" may actually be 0!
-            //
-            // To handle this case we call `SetLastError` to reset it to 0 and
-            // then check it again if we get the "0 error value". If the "last
-            // error" is still 0 then we interpret it as a 0 length buffer and
-            // not an actual error.
-            SetLastError(0);
-            let k = match f1(buf.as_mut_ptr(), n as DWORD) {
-                0 if GetLastError() == 0 => 0,
-                0 => return Err(io::Error::last_os_error()),
-                n => n,
-            } as usize;
-            if k == n && GetLastError() == ERROR_INSUFFICIENT_BUFFER {
-                n *= 2;
-            } else if k >= n {
-                n = k;
-            } else {
-                return Ok(f2(&buf[..k]));
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-pub fn home_dir() -> Option<PathBuf> {
-    dirs::home_dir()
-}
-
-pub fn cargo_home() -> Result<PathBuf> {
-    let cargo_home = env::var_os("CARGO_HOME");
-    let cargo_home = cargo_home.filter(|v| !v.to_string_lossy().trim().is_empty());
-    let cargo_home = if let Some(home) = cargo_home {
-        let cwd = env::current_dir().chain_err(|| ErrorKind::GettingCwd)?;
-        Some(cwd.join(home))
-    } else {
-        None
-    };
-
-    let user_home = || home_dir().map(|p| p.join(".cargo"));
-    cargo_home
-        .or_else(user_home)
-        .ok_or_else(|| ErrorKind::CargoHome.into())
+pub(crate) fn cargo_home() -> Result<PathBuf> {
+    home::cargo_home_with_env(&home_process()).context("failed to determine cargo home")
 }
 
 // Creates a ~/.rustup folder
-pub fn create_rustup_home() -> Result<()> {
+pub(crate) fn create_rustup_home() -> Result<()> {
     // If RUSTUP_HOME is set then don't make any assumptions about where it's
     // ok to put ~/.rustup
-    if env::var_os("RUSTUP_HOME").is_some() {
+    if process().var_os("RUSTUP_HOME").is_some() {
         return Ok(());
     }
 
     let home = rustup_home_in_user_dir()?;
-    fs::create_dir_all(&home).chain_err(|| "unable to create ~/.rustup")?;
+    fs::create_dir_all(home).context("unable to create ~/.rustup")?;
 
     Ok(())
 }
@@ -579,27 +520,16 @@ fn dot_dir(name: &str) -> Option<PathBuf> {
     home_dir().map(|p| p.join(name))
 }
 
-pub fn rustup_home_in_user_dir() -> Result<PathBuf> {
-    dot_dir(".rustup").ok_or_else(|| ErrorKind::RustupHome.into())
+fn rustup_home_in_user_dir() -> Result<PathBuf> {
+    // XXX: This error message seems wrong/bogus.
+    dot_dir(".rustup").ok_or_else(|| anyhow::anyhow!("couldn't find value of RUSTUP_HOME"))
 }
 
-pub fn rustup_home() -> Result<PathBuf> {
-    let rustup_home_env = env::var_os("RUSTUP_HOME");
-
-    let rustup_home = if rustup_home_env.is_some() {
-        let cwd = env::current_dir().chain_err(|| ErrorKind::GettingCwd)?;
-        rustup_home_env.clone().map(|home| cwd.join(home))
-    } else {
-        None
-    };
-
-    let user_home = || dot_dir(".rustup");
-    rustup_home
-        .or_else(user_home)
-        .ok_or_else(|| ErrorKind::RustupHome.into())
+pub(crate) fn rustup_home() -> Result<PathBuf> {
+    home::rustup_home_with_env(&home_process()).context("failed to determine rustup home dir")
 }
 
-pub fn format_path_for_display(path: &str) -> String {
+pub(crate) fn format_path_for_display(path: &str) -> String {
     let unc_present = path.find(r"\\?\");
 
     match unc_present {
@@ -608,73 +538,29 @@ pub fn format_path_for_display(path: &str) -> String {
     }
 }
 
-/// Encodes a utf-8 string as a null-terminated UCS-2 string in bytes
-#[cfg(windows)]
-pub fn string_to_winreg_bytes(s: &str) -> Vec<u8> {
-    use std::os::windows::ffi::OsStrExt;
-    let v: Vec<_> = OsString::from(format!("{}\x00", s)).encode_wide().collect();
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2).to_vec() }
-}
-
-// This is used to decode the value of HKCU\Environment\PATH. If that
-// key is not unicode (or not REG_SZ | REG_EXPAND_SZ) then this
-// returns null.  The winreg library itself does a lossy unicode
-// conversion.
-#[cfg(windows)]
-pub fn string_from_winreg_value(val: &winreg::RegValue) -> Option<String> {
-    use std::slice;
-    use winreg::enums::RegType;
-
-    match val.vtype {
-        RegType::REG_SZ | RegType::REG_EXPAND_SZ => {
-            // Copied from winreg
-            let words = unsafe {
-                #[allow(clippy::cast_ptr_alignment)]
-                slice::from_raw_parts(val.bytes.as_ptr() as *const u16, val.bytes.len() / 2)
-            };
-            String::from_utf16(words).ok().and_then(|mut s| {
-                while s.ends_with('\u{0}') {
-                    s.pop();
-                }
-                Some(s)
-            })
-        }
-        _ => None,
+#[cfg(target_os = "linux")]
+fn copy_and_delete<'a, N>(
+    name: &'static str,
+    src: &'a Path,
+    dest: &'a Path,
+    notify_handler: &'a dyn Fn(N),
+) -> Result<()>
+where
+    N: From<Notification<'a>>,
+{
+    // https://github.com/rust-lang/rustup/issues/1239
+    // This uses std::fs::copy() instead of the faster std::fs::rename() to
+    // avoid cross-device link errors.
+    if src.is_dir() {
+        copy_dir(src, dest, notify_handler).and(remove_dir_all::remove_dir_all(src).with_context(
+            || RustupError::RemovingDirectory {
+                name,
+                path: PathBuf::from(src),
+            },
+        ))
+    } else {
+        copy_file(src, dest).and(remove_file(name, src))
     }
-}
-
-pub fn toolchain_sort<T: AsRef<str>>(v: &mut Vec<T>) {
-    use semver::{Identifier, Version};
-
-    fn special_version(ord: u64, s: &str) -> Version {
-        Version {
-            major: 0,
-            minor: 0,
-            patch: 0,
-            pre: vec![Identifier::Numeric(ord), Identifier::AlphaNumeric(s.into())],
-            build: vec![],
-        }
-    }
-
-    fn toolchain_sort_key(s: &str) -> Version {
-        if s.starts_with("stable") {
-            special_version(0, s)
-        } else if s.starts_with("beta") {
-            special_version(1, s)
-        } else if s.starts_with("nightly") {
-            special_version(2, s)
-        } else {
-            Version::parse(&s.replace("_", "-")).unwrap_or_else(|_| special_version(3, s))
-        }
-    }
-
-    v.sort_by(|a, b| {
-        let a_str: &str = a.as_ref();
-        let b_str: &str = b.as_ref();
-        let a_key = toolchain_sort_key(a_str);
-        let b_key = toolchain_sort_key(b_str);
-        a_key.cmp(&b_key)
-    });
 }
 
 fn rename<'a, N>(
@@ -686,45 +572,73 @@ fn rename<'a, N>(
 where
     N: From<Notification<'a>>,
 {
-    // https://github.com/rust-lang/rustup.rs/issues/1870
+    // https://github.com/rust-lang/rustup/issues/1870
     // 21 fib steps from 1 sums to ~28 seconds, hopefully more than enough
     // for our previous poor performance that avoided the race condition with
     // McAfee and Norton.
+    #[cfg(target_os = "linux")]
+    use libc::EXDEV;
     retry(
-        Fibonacci::from_millis(1).map(jitter).take(21),
+        Fibonacci::from_millis(1).map(jitter).take(26),
         || match fs::rename(src, dest) {
             Ok(()) => OperationResult::Ok(()),
             Err(e) => match e.kind() {
                 io::ErrorKind::PermissionDenied => {
-                    notify_handler(Notification::RenameInUse(&src, &dest).into());
+                    notify_handler(Notification::RenameInUse(src, dest).into());
                     OperationResult::Retry(e)
+                }
+                #[cfg(target_os = "linux")]
+                _ if process().var_os("RUSTUP_PERMIT_COPY_RENAME").is_some()
+                    && Some(EXDEV) == e.raw_os_error() =>
+                {
+                    match copy_and_delete(name, src, dest, notify_handler) {
+                        Ok(()) => OperationResult::Ok(()),
+                        Err(_) => OperationResult::Err(e),
+                    }
                 }
                 _ => OperationResult::Err(e),
             },
         },
     )
-    .chain_err(|| ErrorKind::RenamingFile {
-        name,
-        src: PathBuf::from(src),
-        dest: PathBuf::from(dest),
+    .with_context(|| {
+        format!(
+            "could not rename {} file from '{}' to '{}'",
+            name,
+            src.display(),
+            dest.display()
+        )
     })
 }
 
-pub struct FileReaderWithProgress<'a> {
-    fh: std::io::BufReader<std::fs::File>,
+pub(crate) fn delete_dir_contents(dir_path: &Path) {
+    match remove_dir_all::remove_dir_contents(dir_path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            panic!("Unable to clean up {}: {:?}", dir_path.display(), e);
+        }
+        _ => {}
+    }
+}
+
+pub(crate) struct FileReaderWithProgress<'a> {
+    fh: io::BufReader<File>,
     notify_handler: &'a dyn Fn(Notification<'_>),
     nbytes: u64,
     flen: u64,
 }
 
 impl<'a> FileReaderWithProgress<'a> {
-    pub fn new_file(path: &Path, notify_handler: &'a dyn Fn(Notification<'_>)) -> Result<Self> {
-        let fh = match std::fs::File::open(path) {
+    pub(crate) fn new_file(
+        path: &Path,
+        notify_handler: &'a dyn Fn(Notification<'_>),
+    ) -> Result<Self> {
+        let fh = match File::open(path) {
             Ok(fh) => fh,
-            Err(_) => Err(ErrorKind::ReadingFile {
-                name: "downloaded",
-                path: path.to_path_buf(),
-            })?,
+            Err(_) => {
+                bail!(RustupError::ReadingFile {
+                    name: "downloaded",
+                    path: path.to_path_buf(),
+                })
+            }
         };
 
         // Inform the tracker of the file size
@@ -742,8 +656,8 @@ impl<'a> FileReaderWithProgress<'a> {
     }
 }
 
-impl<'a> std::io::Read for FileReaderWithProgress<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl<'a> io::Read for FileReaderWithProgress<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self.fh.read(buf) {
             Ok(nbytes) => {
                 self.nbytes += nbytes as u64;
@@ -760,46 +674,77 @@ impl<'a> std::io::Read for FileReaderWithProgress<'a> {
     }
 }
 
+// search user database to get home dir of euid user
+#[cfg(unix)]
+pub(crate) fn home_dir_from_passwd() -> Option<PathBuf> {
+    use std::ffi::{CStr, OsString};
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStringExt;
+    use std::ptr;
+    unsafe {
+        let init_size = match libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) {
+            -1 => 1024,
+            n => n as usize,
+        };
+        let mut buf = Vec::with_capacity(init_size);
+        let mut pwd: MaybeUninit<libc::passwd> = MaybeUninit::uninit();
+        let mut pwdp = ptr::null_mut();
+        match libc::getpwuid_r(
+            libc::geteuid(),
+            pwd.as_mut_ptr(),
+            buf.as_mut_ptr(),
+            buf.capacity(),
+            &mut pwdp,
+        ) {
+            0 if !pwdp.is_null() => {
+                let pwd = pwd.assume_init();
+                let bytes = CStr::from_ptr(pwd.pw_dir).to_bytes().to_vec();
+                let pw_dir = OsString::from_vec(bytes);
+                Some(PathBuf::from(pw_dir))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use rustup_macros::unit_test as test;
+
     use super::*;
 
     #[test]
-    fn test_cargo_home() {
-        // CARGO_HOME unset, we'll get the default ending in /.cargo
-        let cargo_home1 = cargo_home();
-        let ch = format!("{}", cargo_home1.unwrap().display());
-        assert!(ch.contains("/.cargo"));
+    fn test_remove_file() {
+        let tempdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
+        let f_path = tempdir.path().join("f");
+        File::create(&f_path).unwrap();
 
-        env::set_var("CARGO_HOME", "/test");
-        let cargo_home2 = cargo_home();
-        assert_eq!("/test", format!("{}", cargo_home2.unwrap().display()));
+        assert!(f_path.exists());
+        assert!(remove_file("f", &f_path).is_ok());
+
+        assert!(!f_path.exists());
+        let result = remove_file("f", &f_path);
+        let err = result.unwrap_err();
+
+        match err.downcast_ref::<RustupError>() {
+            Some(RustupError::RemovingFile { name, path }) => {
+                assert_eq!(*name, "f");
+                assert_eq!(path.clone(), f_path);
+            }
+            _ => panic!("Expected an error removing file"),
+        }
     }
 
     #[test]
-    fn test_toochain_sort() {
-        let expected = vec![
-            "stable-x86_64-unknown-linux-gnu",
-            "beta-x86_64-unknown-linux-gnu",
-            "nightly-x86_64-unknown-linux-gnu",
-            "1.0.0-x86_64-unknown-linux-gnu",
-            "1.2.0-x86_64-unknown-linux-gnu",
-            "1.8.0-x86_64-unknown-linux-gnu",
-            "1.10.0-x86_64-unknown-linux-gnu",
-        ];
+    fn test_ensure_file_removed() {
+        let tempdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
+        let f_path = tempdir.path().join("f");
+        File::create(&f_path).unwrap();
 
-        let mut v = vec![
-            "1.8.0-x86_64-unknown-linux-gnu",
-            "1.0.0-x86_64-unknown-linux-gnu",
-            "nightly-x86_64-unknown-linux-gnu",
-            "stable-x86_64-unknown-linux-gnu",
-            "1.10.0-x86_64-unknown-linux-gnu",
-            "beta-x86_64-unknown-linux-gnu",
-            "1.2.0-x86_64-unknown-linux-gnu",
-        ];
+        assert!(f_path.exists());
+        assert!(ensure_file_removed("f", &f_path).is_ok());
 
-        toolchain_sort(&mut v);
-
-        assert_eq!(expected, v);
+        assert!(!f_path.exists());
+        assert!(ensure_file_removed("f", &f_path).is_ok());
     }
 }

@@ -1,10 +1,11 @@
-///!  Utility functions for rustup
-pub mod notifications;
+//!  Utility functions for Rustup
+pub(crate) mod notifications;
 pub mod raw;
-pub mod toml_utils;
-pub mod tty;
+pub(crate) mod toml_utils;
+pub(crate) mod tty;
+pub(crate) mod units;
 #[allow(clippy::module_inception)]
 pub mod utils;
 
-pub use crate::utils::notifications::Notification;
-pub mod notify;
+pub(crate) use crate::utils::notifications::Notification;
+pub(crate) mod notify;

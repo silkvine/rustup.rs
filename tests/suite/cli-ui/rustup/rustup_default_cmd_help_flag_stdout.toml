@@ -1,0 +1,20 @@
+bin.name = "rustup"
+args = ["default","--help"]
+stdout = """
+...
+Set the default toolchain
+
+Usage: rustup[EXE] default [toolchain]
+
+Arguments:
+  [toolchain]  'none', a toolchain name, such as 'stable', 'nightly', '1.8.0', or a custom toolchain
+               name. For more information see `rustup help toolchain`
+
+Options:
+  -h, --help  Print help
+
+Discussion:
+    Sets the default toolchain to the one specified. If the toolchain
+    is not already installed then it is installed first.
+"""
+stderr = ""

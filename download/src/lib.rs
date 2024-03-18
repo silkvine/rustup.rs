@@ -2,15 +2,28 @@
 #![deny(rust_2018_idioms)]
 
 use std::path::Path;
+
+use anyhow::Context;
+pub use anyhow::Result;
 use url::Url;
 
 mod errors;
 pub use crate::errors::*;
 
+/// User agent header value for HTTP request.
+/// See: https://github.com/rust-lang/rustup/issues/2860.
+const USER_AGENT: &str = concat!("rustup/", env!("CARGO_PKG_VERSION"));
+
 #[derive(Debug, Copy, Clone)]
 pub enum Backend {
     Curl,
-    Reqwest,
+    Reqwest(TlsBackend),
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum TlsBackend {
+    Rustls,
+    Default,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -30,24 +43,27 @@ fn download_with_backend(
 ) -> Result<()> {
     match backend {
         Backend::Curl => curl::download(url, resume_from, callback),
-        Backend::Reqwest => reqwest_be::download(url, resume_from, callback),
+        Backend::Reqwest(tls) => reqwest_be::download(url, resume_from, callback, tls),
     }
 }
+
+type DownloadCallback<'a> = &'a dyn Fn(Event<'_>) -> Result<()>;
 
 pub fn download_to_path_with_backend(
     backend: Backend,
     url: &Url,
     path: &Path,
     resume_from_partial: bool,
-    callback: Option<&dyn Fn(Event<'_>) -> Result<()>>,
+    callback: Option<DownloadCallback<'_>>,
 ) -> Result<()> {
     use std::cell::RefCell;
+    use std::fs::remove_file;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
 
     || -> Result<()> {
         let (file, resume_from) = if resume_from_partial {
-            let possible_partial = OpenOptions::new().read(true).open(&path);
+            let possible_partial = OpenOptions::new().read(true).open(path);
 
             let downloaded_so_far = if let Ok(mut partial) = possible_partial {
                 if let Some(cb) = callback {
@@ -76,8 +92,9 @@ pub fn download_to_path_with_backend(
             let mut possible_partial = OpenOptions::new()
                 .write(true)
                 .create(true)
-                .open(&path)
-                .chain_err(|| "error opening file for download")?;
+                .truncate(false)
+                .open(path)
+                .context("error opening file for download")?;
 
             possible_partial.seek(SeekFrom::End(0))?;
 
@@ -87,8 +104,9 @@ pub fn download_to_path_with_backend(
                 OpenOptions::new()
                     .write(true)
                     .create(true)
-                    .open(&path)
-                    .chain_err(|| "error creating file for download")?,
+                    .truncate(true)
+                    .open(path)
+                    .context("error creating file for download")?,
                 0,
             )
         };
@@ -99,7 +117,7 @@ pub fn download_to_path_with_backend(
             if let Event::DownloadDataReceived(data) = event {
                 file.borrow_mut()
                     .write_all(data)
-                    .chain_err(|| "unable to write download to disk")?;
+                    .context("unable to write download to disk")?;
             }
             match callback {
                 Some(cb) => cb(event),
@@ -109,27 +127,37 @@ pub fn download_to_path_with_backend(
 
         file.borrow_mut()
             .sync_data()
-            .chain_err(|| "unable to sync download to disk")?;
+            .context("unable to sync download to disk")?;
 
         Ok(())
     }()
     .map_err(|e| {
-        // TODO is there any point clearing up here? What kind of errors will leave us with an unusable partial?
-        e
+        // TODO: We currently clear up the cached download on any error, should we restrict it to a subset?
+        if let Err(file_err) = remove_file(path).context("cleaning up cached downloads") {
+            file_err.context(e)
+        } else {
+            e
+        }
     })
 }
+
+#[cfg(all(not(feature = "reqwest-backend"), not(feature = "curl-backend")))]
+compile_error!("Must enable at least one backend");
 
 /// Download via libcurl; encrypt with the native (or OpenSSl) TLS
 /// stack via libcurl
 #[cfg(feature = "curl-backend")]
 pub mod curl {
-    use super::Event;
-    use crate::errors::*;
-    use curl::easy::Easy;
     use std::cell::RefCell;
     use std::str;
     use std::time::Duration;
+
+    use anyhow::{Context, Result};
+    use curl::easy::Easy;
     use url::Url;
+
+    use super::Event;
+    use crate::errors::*;
 
     pub fn download(
         url: &Url,
@@ -145,17 +173,12 @@ pub mod curl {
         EASY.with(|handle| {
             let mut handle = handle.borrow_mut();
 
-            handle
-                .url(&url.to_string())
-                .chain_err(|| "failed to set url")?;
-            handle
-                .follow_location(true)
-                .chain_err(|| "failed to set follow redirects")?;
+            handle.url(url.as_ref())?;
+            handle.follow_location(true)?;
+            handle.useragent(super::USER_AGENT)?;
 
             if resume_from > 0 {
-                handle
-                    .resume_from(resume_from)
-                    .chain_err(|| "setting the range header for download resumption")?;
+                handle.resume_from(resume_from)?;
             } else {
                 // an error here indicates that the range header isn't supported by underlying curl,
                 // so there's nothing to "clear" - safe to ignore this error.
@@ -163,9 +186,7 @@ pub mod curl {
             }
 
             // Take at most 30s to connect
-            handle
-                .connect_timeout(Duration::new(30, 0))
-                .chain_err(|| "failed to set connect timeout")?;
+            handle.connect_timeout(Duration::new(30, 0))?;
 
             {
                 let cberr = RefCell::new(None);
@@ -174,38 +195,36 @@ pub mod curl {
                 // Data callback for libcurl which is called with data that's
                 // downloaded. We just feed it into our hasher and also write it out
                 // to disk.
-                transfer
-                    .write_function(|data| match callback(Event::DownloadDataReceived(data)) {
+                transfer.write_function(|data| {
+                    match callback(Event::DownloadDataReceived(data)) {
                         Ok(()) => Ok(data.len()),
                         Err(e) => {
                             *cberr.borrow_mut() = Some(e);
                             Ok(0)
                         }
-                    })
-                    .chain_err(|| "failed to set write")?;
+                    }
+                })?;
 
                 // Listen for headers and parse out a `Content-Length` (case-insensitive) if it
                 // comes so we know how much we're downloading.
-                transfer
-                    .header_function(|header| {
-                        if let Ok(data) = str::from_utf8(header) {
-                            let prefix = "content-length: ";
-                            if data.to_ascii_lowercase().starts_with(prefix) {
-                                if let Ok(s) = data[prefix.len()..].trim().parse::<u64>() {
-                                    let msg = Event::DownloadContentLengthReceived(s + resume_from);
-                                    match callback(msg) {
-                                        Ok(()) => (),
-                                        Err(e) => {
-                                            *cberr.borrow_mut() = Some(e);
-                                            return false;
-                                        }
+                transfer.header_function(|header| {
+                    if let Ok(data) = str::from_utf8(header) {
+                        let prefix = "content-length: ";
+                        if data.to_ascii_lowercase().starts_with(prefix) {
+                            if let Ok(s) = data[prefix.len()..].trim().parse::<u64>() {
+                                let msg = Event::DownloadContentLengthReceived(s + resume_from);
+                                match callback(msg) {
+                                    Ok(()) => (),
+                                    Err(e) => {
+                                        *cberr.borrow_mut() = Some(e);
+                                        return false;
                                     }
                                 }
                             }
                         }
-                        true
-                    })
-                    .chain_err(|| "failed to set header")?;
+                    }
+                    true
+                })?;
 
                 // If an error happens check to see if we had a filesystem error up
                 // in `cberr`, but we always want to punt it up.
@@ -217,9 +236,9 @@ pub mod curl {
                         None => {
                             // Otherwise, return the error from curl
                             if e.is_file_couldnt_read_file() {
-                                Err(e).chain_err(|| ErrorKind::FileNotFound)
+                                Err(e).context(DownloadError::FileNotFound)
                             } else {
-                                Err(e).chain_err(|| "error during download")
+                                Err(e).context("error during download")?
                             }
                         }
                     }
@@ -227,13 +246,11 @@ pub mod curl {
             }
 
             // If we didn't get a 20x or 0 ("OK" for files) then return an error
-            let code = handle
-                .response_code()
-                .chain_err(|| "failed to get response code")?;
+            let code = handle.response_code()?;
             match code {
                 0 | 200..=299 => {}
                 _ => {
-                    return Err(ErrorKind::HttpStatus(code).into());
+                    return Err(DownloadError::HttpStatus(code).into());
                 }
             };
 
@@ -244,29 +261,42 @@ pub mod curl {
 
 #[cfg(feature = "reqwest-backend")]
 pub mod reqwest_be {
-    use super::Event;
-    use crate::errors::*;
-    use lazy_static::lazy_static;
-    use reqwest::{header, Client, Proxy, Response};
+    #[cfg(all(
+        not(feature = "reqwest-rustls-tls"),
+        not(feature = "reqwest-default-tls")
+    ))]
+    compile_error!("Must select a reqwest TLS backend");
+
     use std::io;
     use std::time::Duration;
+
+    use anyhow::{anyhow, Context, Result};
+    #[cfg(any(feature = "reqwest-rustls-tls", feature = "reqwest-default-tls"))]
+    use once_cell::sync::Lazy;
+    use reqwest::blocking::{Client, ClientBuilder, Response};
+    use reqwest::{header, Proxy};
     use url::Url;
+
+    use super::Event;
+    use super::TlsBackend;
+    use crate::errors::*;
 
     pub fn download(
         url: &Url,
         resume_from: u64,
         callback: &dyn Fn(Event<'_>) -> Result<()>,
+        tls: TlsBackend,
     ) -> Result<()> {
         // Short-circuit reqwest for the "file:" URL scheme
         if download_from_file_url(url, resume_from, callback)? {
             return Ok(());
         }
 
-        let mut res = request(url, resume_from).chain_err(|| "failed to make network request")?;
+        let mut res = request(url, resume_from, tls).context("failed to make network request")?;
 
         if !res.status().is_success() {
             let code: u16 = res.status().into();
-            return Err(ErrorKind::HttpStatus(u32::from(code)).into());
+            return Err(anyhow!(DownloadError::HttpStatus(u32::from(code))));
         }
 
         let buffer_size = 0x10000;
@@ -279,8 +309,7 @@ pub mod reqwest_be {
         }
 
         loop {
-            let bytes_read =
-                io::Read::read(&mut res, &mut buffer).chain_err(|| "error reading from socket")?;
+            let bytes_read = io::Read::read(&mut res, &mut buffer)?;
 
             if bytes_read != 0 {
                 callback(Event::DownloadDataReceived(&buffer[0..bytes_read]))?;
@@ -290,38 +319,70 @@ pub mod reqwest_be {
         }
     }
 
-    lazy_static! {
-        static ref CLIENT: Client = {
-            let catcher = || {
-                Client::builder()
-                    .gzip(false)
-                    .proxy(Proxy::custom(env_proxy))
-                    .timeout(Duration::from_secs(30))
-                    .build()
-            };
-
-            // woah, an unwrap?!
-            // It's OK. This is the same as what is happening in curl.
-            //
-            // The curl::Easy::new() internally assert!s that the initialized
-            // Easy is not null. Inside reqwest, the errors here would be from
-            // the TLS library returning a null pointer as well.
-            catcher().unwrap()
-        };
+    fn client_generic() -> ClientBuilder {
+        Client::builder()
+            .gzip(false)
+            .user_agent(super::USER_AGENT)
+            .proxy(Proxy::custom(env_proxy))
+            .timeout(Duration::from_secs(30))
     }
+
+    #[cfg(feature = "reqwest-rustls-tls")]
+    static CLIENT_RUSTLS_TLS: Lazy<Client> = Lazy::new(|| {
+        let catcher = || client_generic().use_rustls_tls().build();
+
+        // woah, an unwrap?!
+        // It's OK. This is the same as what is happening in curl.
+        //
+        // The curl::Easy::new() internally assert!s that the initialized
+        // Easy is not null. Inside reqwest, the errors here would be from
+        // the TLS library returning a null pointer as well.
+        catcher().unwrap()
+    });
+
+    #[cfg(feature = "reqwest-default-tls")]
+    static CLIENT_DEFAULT_TLS: Lazy<Client> = Lazy::new(|| {
+        let catcher = || client_generic().build();
+
+        // woah, an unwrap?!
+        // It's OK. This is the same as what is happening in curl.
+        //
+        // The curl::Easy::new() internally assert!s that the initialized
+        // Easy is not null. Inside reqwest, the errors here would be from
+        // the TLS library returning a null pointer as well.
+        catcher().unwrap()
+    });
 
     fn env_proxy(url: &Url) -> Option<Url> {
         env_proxy::for_url(url).to_url()
     }
 
-    fn request(url: &Url, resume_from: u64) -> reqwest::Result<Response> {
-        let mut req = CLIENT.get(url.as_str());
+    fn request(
+        url: &Url,
+        resume_from: u64,
+        backend: TlsBackend,
+    ) -> Result<Response, DownloadError> {
+        let client: &Client = match backend {
+            #[cfg(feature = "reqwest-rustls-tls")]
+            TlsBackend::Rustls => &CLIENT_RUSTLS_TLS,
+            #[cfg(not(feature = "reqwest-rustls-tls"))]
+            TlsBackend::Rustls => {
+                return Err(DownloadError::BackendUnavailable("reqwest rustls"));
+            }
+            #[cfg(feature = "reqwest-default-tls")]
+            TlsBackend::Default => &CLIENT_DEFAULT_TLS,
+            #[cfg(not(feature = "reqwest-default-tls"))]
+            TlsBackend::Default => {
+                return Err(DownloadError::BackendUnavailable("reqwest default TLS"));
+            }
+        };
+        let mut req = client.get(url.as_str());
 
         if resume_from != 0 {
-            req = req.header(header::RANGE, format!("bytes={}-", resume_from));
+            req = req.header(header::RANGE, format!("bytes={resume_from}-"));
         }
 
-        req.send()
+        Ok(req.send()?)
     }
 
     fn download_from_file_url(
@@ -335,22 +396,21 @@ pub mod reqwest_be {
         if url.scheme() == "file" {
             let src = url
                 .to_file_path()
-                .map_err(|_| Error::from(format!("bogus file url: '{}'", url)))?;
+                .map_err(|_| DownloadError::Message(format!("bogus file url: '{url}'")))?;
             if !src.is_file() {
                 // Because some of rustup's logic depends on checking
                 // the error when a downloaded file doesn't exist, make
                 // the file case return the same error value as the
                 // network case.
-                return Err(ErrorKind::FileNotFound.into());
+                return Err(anyhow!(DownloadError::FileNotFound));
             }
 
-            let mut f = fs::File::open(src).chain_err(|| "unable to open downloaded file")?;
+            let mut f = fs::File::open(src).context("unable to open downloaded file")?;
             io::Seek::seek(&mut f, io::SeekFrom::Start(resume_from))?;
 
             let mut buffer = vec![0u8; 0x10000];
             loop {
-                let bytes_read = io::Read::read(&mut f, &mut buffer)
-                    .chain_err(|| "unable to read downloaded file")?;
+                let bytes_read = io::Read::read(&mut f, &mut buffer)?;
                 if bytes_read == 0 {
                     break;
                 }
@@ -367,6 +427,8 @@ pub mod reqwest_be {
 #[cfg(not(feature = "curl-backend"))]
 pub mod curl {
 
+    use anyhow::{anyhow, Result};
+
     use super::Event;
     use crate::errors::*;
     use url::Url;
@@ -376,14 +438,17 @@ pub mod curl {
         _resume_from: u64,
         _callback: &dyn Fn(Event<'_>) -> Result<()>,
     ) -> Result<()> {
-        Err(ErrorKind::BackendUnavailable("curl").into())
+        Err(anyhow!(DownloadError::BackendUnavailable("curl")))
     }
 }
 
 #[cfg(not(feature = "reqwest-backend"))]
 pub mod reqwest_be {
 
+    use anyhow::{anyhow, Result};
+
     use super::Event;
+    use super::TlsBackend;
     use crate::errors::*;
     use url::Url;
 
@@ -391,7 +456,8 @@ pub mod reqwest_be {
         _url: &Url,
         _resume_from: u64,
         _callback: &dyn Fn(Event<'_>) -> Result<()>,
+        _tls: TlsBackend,
     ) -> Result<()> {
-        Err(ErrorKind::BackendUnavailable("reqwest").into())
+        Err(anyhow!(DownloadError::BackendUnavailable("reqwest")))
     }
 }
